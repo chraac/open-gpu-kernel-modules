@@ -104,6 +104,7 @@
 
 #define SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID   0x20C2
 #define SEC2_POSTBL_TIMING_CMP_170HX_10GB_PCI_DEVICE_ID 0x2082
+#define SEC2_POSTBL_TIMING_CMP_90HX_10GB_PCI_DEVICE_ID  0x220D
 #define SEC2_POSTBL_TIMING_SIGNATURE_SIZE          0x0000f800ULL
 #define SEC2_POSTBL_TIMING_FILL_DWORD              0x000004a7U
 #define SEC2_POSTBL_TIMING_DMEM_PATH               "/lib/firmware/nvidia/ga100/gsp/dmem.bin"
@@ -4846,94 +4847,205 @@ _kgspBootGspRm(OBJGPU *pGpu, KernelGsp *pKernelGsp, GSP_FIRMWARE *pGspFw, GPU_MA
     // Setup arguments for bootstrapping GSP
     NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, kgspPrepareForBootstrap_HAL(pGpu, pKernelGsp, KGSP_BOOT_MODE_NORMAL));
 
-    if (_kgspSec2PostblTimingEnabled(pGpu))
+    NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
+    if (_kgspSec2PostblTimingEnabled(pGpu) || 
+        (devId == SEC2_POSTBL_TIMING_CMP_90HX_10GB_PCI_DEVICE_ID))
     {
-        NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
         NvU32 plmIdx, attempt;
         NV_STATUS plmStatus;
 
-        static const struct { NvU32 addr; NvU32 value; const char *name; } plmTable[] = {
-            { 0x001fa7ccU, 0xfffff0ffU, "WPR_CFG" },
-            { 0x009a0148U, 0xffffffffU, "FBPA" },
-            { 0x001fa7c4U, 0xffffffffU, "WPR" },
-            { 0x00823804U, 0xffffffffU, "FEAT" },
-        };
+        if (devId != SEC2_POSTBL_TIMING_CMP_90HX_10GB_PCI_DEVICE_ID) {
+            static const struct { NvU32 addr; NvU32 value; const char *name; } plmTable[] = {
+                { 0x001fa7ccU, 0xfffff0ffU, "WPR_CFG" },
+                { 0x009a0148U, 0xffffffffU, "FBPA" },
+                { 0x001fa7c4U, 0xffffffffU, "WPR" },
+                { 0x00823804U, 0xffffffffU, "FEAT" },
+            };
 
-        NvU32 wpr2Lo = GPU_REG_RD32(pGpu, 0x001fa824U);
-        NvU32 wpr2Hi = GPU_REG_RD32(pGpu, 0x001fa828U);
-        NV_PRINTF(LEVEL_ERROR,
-                  "SEC2_DEBUG: saved WPR2 lo=0x%08x hi=0x%08x\n",
-                  wpr2Lo, wpr2Hi);
+            NvU32 wpr2Lo = GPU_REG_RD32(pGpu, 0x001fa824U);
+            NvU32 wpr2Hi = GPU_REG_RD32(pGpu, 0x001fa828U);
+            NV_PRINTF(LEVEL_ERROR,
+                    "SEC2_DEBUG: saved WPR2 lo=0x%08x hi=0x%08x\n",
+                    wpr2Lo, wpr2Hi);
 
-        for (plmIdx = 0; plmIdx < 4; plmIdx++)
-        {
-            NvBool opened = NV_FALSE;
-            for (attempt = 0; attempt < 2 && !opened; attempt++)
+            for (plmIdx = 0; plmIdx < 4; plmIdx++)
             {
-                GPU_REG_WR32(pGpu, 0x001fa824U, wpr2Lo);
-                GPU_REG_WR32(pGpu, 0x001fa828U, wpr2Hi);
+                NvBool opened = NV_FALSE;
+                for (attempt = 0; attempt < 2 && !opened; attempt++)
+                {
+                    GPU_REG_WR32(pGpu, 0x001fa824U, wpr2Lo);
+                    GPU_REG_WR32(pGpu, 0x001fa828U, wpr2Hi);
 
-                plmStatus = kgspSec2PostblTimingRefillPayload(pGpu, pKernelGsp,
-                    plmTable[plmIdx].addr, plmTable[plmIdx].value);
-                if (plmStatus != NV_OK)
-                    continue;
+                    plmStatus = kgspSec2PostblTimingRefillPayload(pGpu, pKernelGsp,
+                        plmTable[plmIdx].addr, plmTable[plmIdx].value);
+                    if (plmStatus != NV_OK)
+                        continue;
 
-                plmStatus = kgspExecuteBooterLoad_HAL(pGpu, pKernelGsp,
-                    memdescGetPhysAddr(pKernelGsp->pWprMetaDescriptor, AT_GPU, 0));
+                    plmStatus = kgspExecuteBooterLoad_HAL(pGpu, pKernelGsp,
+                        memdescGetPhysAddr(pKernelGsp->pWprMetaDescriptor, AT_GPU, 0));
 
-                NvU32 regVal = GPU_REG_RD32(pGpu, plmTable[plmIdx].addr);
-                NV_PRINTF(LEVEL_ERROR,
-                          "SEC2_DEBUG: PLM[%u] %s(0x%x) attempt=%u status=0x%x reg=0x%08x\n",
-                          plmIdx, plmTable[plmIdx].name,
-                          plmTable[plmIdx].addr, attempt, plmStatus, regVal);
+                    NvU32 regVal = GPU_REG_RD32(pGpu, plmTable[plmIdx].addr);
+                    NV_PRINTF(LEVEL_ERROR,
+                            "SEC2_DEBUG: PLM[%u] %s(0x%x) attempt=%u status=0x%x reg=0x%08x\n",
+                            plmIdx, plmTable[plmIdx].name,
+                            plmTable[plmIdx].addr, attempt, plmStatus, regVal);
 
-                if (regVal == plmTable[plmIdx].value)
-                    opened = NV_TRUE;
-            }
-            if (!opened)
-                NV_PRINTF(LEVEL_ERROR,
-                          "SEC2_DEBUG: FAILED to open %s after 2 attempts\n",
-                          plmTable[plmIdx].name);
-        }
-
-        GPU_REG_WR32(pGpu, 0x001fa824U, wpr2Lo);
-        GPU_REG_WR32(pGpu, 0x001fa828U, wpr2Hi);
-
-        NV_PRINTF(LEVEL_ERROR,
-                  "SEC2_DEBUG: PLMs: FEAT=0x%08x FBPA=0x%08x WPR=0x%08x WPR_CFG=0x%08x\n",
-                  GPU_REG_RD32(pGpu, 0x00823804U),
-                  GPU_REG_RD32(pGpu, 0x009a0148U),
-                  GPU_REG_RD32(pGpu, 0x001fa7c4U),
-                  GPU_REG_RD32(pGpu, 0x001fa7ccU));
-
-        {
-            NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
-            NvU32 cfg1Value;
-            NvU32 lmrValue;
-
-            if (devId == SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID)
-            {
-                cfg1Value = 0x02779000U;  // 8GB card: 64GB unlock
-                lmrValue  = 0x0000020BU;
-            }
-            else
-            {
-                cfg1Value = 0x02669000U;  // 10GB card: 40GB unlock
-                lmrValue  = 0x0000028AU;
+                    if (regVal == plmTable[plmIdx].value)
+                        opened = NV_TRUE;
+                }
+                if (!opened)
+                    NV_PRINTF(LEVEL_ERROR,
+                            "SEC2_DEBUG: FAILED to open %s after 2 attempts\n",
+                            plmTable[plmIdx].name);
             }
 
-            GPU_REG_WR32(pGpu, 0x0082381cU, 0x88888888U);
-            GPU_REG_WR32(pGpu, 0x00823820U, 0x00000008U);
-            GPU_REG_WR32(pGpu, 0x009a0204U, cfg1Value);
-            GPU_REG_WR32(pGpu, 0x00100ce0U, lmrValue);
+            GPU_REG_WR32(pGpu, 0x001fa824U, wpr2Lo);
+            GPU_REG_WR32(pGpu, 0x001fa828U, wpr2Hi);
 
             NV_PRINTF(LEVEL_ERROR,
-                      "SEC2_DEBUG: POST-WRITE SS0=0x%08x SS1=0x%08x "
-                      "CFG1=0x%08x LMR=0x%08x (devId=0x%x)\n",
-                      GPU_REG_RD32(pGpu, 0x0082381cU),
-                      GPU_REG_RD32(pGpu, 0x00823820U),
-                      GPU_REG_RD32(pGpu, 0x009a0204U),
-                      GPU_REG_RD32(pGpu, 0x00100ce0U),
+                    "SEC2_DEBUG: PLMs: FEAT=0x%08x FBPA=0x%08x WPR=0x%08x WPR_CFG=0x%08x\n",
+                    GPU_REG_RD32(pGpu, 0x00823804U),
+                    GPU_REG_RD32(pGpu, 0x009a0148U),
+                    GPU_REG_RD32(pGpu, 0x001fa7c4U),
+                    GPU_REG_RD32(pGpu, 0x001fa7ccU));
+
+            {
+                NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
+                NvU32 cfg1Value;
+                NvU32 lmrValue;
+
+                if (devId == SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID)
+                {
+                    cfg1Value = 0x02779000U;  // 8GB card: 64GB unlock
+                    lmrValue  = 0x0000020BU;
+                }
+                else
+                {
+                    cfg1Value = 0x02669000U;  // 10GB card: 40GB unlock
+                    lmrValue  = 0x0000028AU;
+                }
+
+                GPU_REG_WR32(pGpu, 0x0082381cU, 0x88888888U);
+                GPU_REG_WR32(pGpu, 0x00823820U, 0x00000008U);
+                GPU_REG_WR32(pGpu, 0x009a0204U, cfg1Value);
+                GPU_REG_WR32(pGpu, 0x00100ce0U, lmrValue);
+
+                NV_PRINTF(LEVEL_ERROR,
+                        "SEC2_DEBUG: POST-WRITE SS0=0x%08x SS1=0x%08x "
+                        "CFG1=0x%08x LMR=0x%08x (devId=0x%x)\n",
+                        GPU_REG_RD32(pGpu, 0x0082381cU),
+                        GPU_REG_RD32(pGpu, 0x00823820U),
+                        GPU_REG_RD32(pGpu, 0x009a0204U),
+                        GPU_REG_RD32(pGpu, 0x00100ce0U),
+                        devId);
+            }
+        } else {
+            /*
+            * CMP 90HX (GA102) compute unlock.
+            * Opens PLM on FEAT_OVR + GFX_SPEED_SELECT, then writes
+            * SM_SPEED_SELECT (SS0/SS1) and GFX_SPEED_SELECT overrides.
+            *
+            * Device ID: 0x220D (CMP 90HX)
+            * Compute only — no VRAM unlock needed (GDDR6, not HBM2e).
+            */
+
+            /* PLM registers to open via SEC2 Booter */
+            static const struct { NvU32 addr; NvU32 value; const char *name; } cmp90PlmTable[] = {
+                { 0x00823804U, 0xFFFFF3FFU, "FEAT_OVR_SM_SPD_PLM"   },
+                { 0x00823B04U, 0xFFFFF3FFU, "FEAT_OVR_GFX_SPD_PLM"  },
+            };
+
+            /* Compute registers to write via GPU_REG_WR32 after PLM-open */
+            static const struct { NvU32 addr; NvU32 value; const char *name; } cmp90WriteTable[] = {
+                { 0x0082381CU, 0x88888888U, "FEAT_OVR_SM_SPD (SS0)"      },
+                { 0x00823820U, 0x00000008U, "FEAT_OVR_SM_SPD_1 (SS1)"    },
+                { 0x00823830U, 0x00000004U, "FEAT_OVR_GFX_SPD"           },
+            };
+
+            NvU32 cmp90i, cmp90attempt;
+            NV_STATUS cmp90Status;
+            const NvU32 cmp90PlmCount = sizeof(cmp90PlmTable) / sizeof(cmp90PlmTable[0]);
+            const NvU32 cmp90WriteCount = sizeof(cmp90WriteTable) / sizeof(cmp90WriteTable[0]);
+
+            /* Save WPR2 bounds for Booter calls */
+            NvU32 cmp90Wpr2Lo = GPU_REG_RD32(pGpu, 0x001fa824U);
+            NvU32 cmp90Wpr2Hi = GPU_REG_RD32(pGpu, 0x001fa828U);
+
+            NV_PRINTF(LEVEL_ERROR,
+                      "CMP90_DEBUG: Starting compute unlock for devId=0x%04x\n",
+                      devId);
+
+            /* Phase 1: Open PLM registers via SEC2 Booter */
+            for (cmp90i = 0; cmp90i < cmp90PlmCount; cmp90i++)
+            {
+                NvBool wrote = NV_FALSE;
+                NvU32 beforeVal = GPU_REG_RD32(pGpu, cmp90PlmTable[cmp90i].addr);
+
+                NV_PRINTF(LEVEL_ERROR,
+                          "CMP90_DEBUG: PLM[%u] %s(0x%x) before=0x%08x target=0x%08x\n",
+                          cmp90i, cmp90PlmTable[cmp90i].name,
+                          cmp90PlmTable[cmp90i].addr, beforeVal,
+                          cmp90PlmTable[cmp90i].value);
+
+                for (cmp90attempt = 0; cmp90attempt < 2 && !wrote; cmp90attempt++)
+                {
+                    /* Restore WPR2 bounds before Booter call */
+                    GPU_REG_WR32(pGpu, 0x001fa824U, cmp90Wpr2Lo);
+                    GPU_REG_WR32(pGpu, 0x001fa828U, cmp90Wpr2Hi);
+
+                    cmp90Status = kgspSec2PostblTimingRefillPayload(pGpu, pKernelGsp,
+                        cmp90PlmTable[cmp90i].addr, cmp90PlmTable[cmp90i].value);
+                    if (cmp90Status != NV_OK)
+                    {
+                        NV_PRINTF(LEVEL_ERROR,
+                                  "CMP90_DEBUG: PLM[%u] refill failed status=0x%x\n",
+                                  cmp90i, cmp90Status);
+                        continue;
+                    }
+
+                    cmp90Status = kgspExecuteBooterLoad_HAL(pGpu, pKernelGsp,
+                        memdescGetPhysAddr(pKernelGsp->pWprMetaDescriptor, AT_GPU, 0));
+
+                    NvU32 afterVal = GPU_REG_RD32(pGpu, cmp90PlmTable[cmp90i].addr);
+                    NV_PRINTF(LEVEL_ERROR,
+                              "CMP90_DEBUG: PLM[%u] %s attempt=%u status=0x%x "
+                              "before=0x%08x after=0x%08x target=0x%08x\n",
+                              cmp90i, cmp90PlmTable[cmp90i].name,
+                              cmp90attempt, cmp90Status,
+                              beforeVal, afterVal,
+                              cmp90PlmTable[cmp90i].value);
+
+                    if (afterVal == cmp90PlmTable[cmp90i].value)
+                        wrote = NV_TRUE;
+                }
+
+                if (!wrote)
+                    NV_PRINTF(LEVEL_ERROR,
+                              "CMP90_DEBUG: PLM[%u] %s FAILED to set\n",
+                              cmp90i, cmp90PlmTable[cmp90i].name);
+            }
+
+            /* Phase 2: Write compute registers via host BAR0 */
+            for (cmp90i = 0; cmp90i < cmp90WriteCount; cmp90i++)
+            {
+                GPU_REG_WR32(pGpu, cmp90WriteTable[cmp90i].addr,
+                             cmp90WriteTable[cmp90i].value);
+                NvU32 rdBack = GPU_REG_RD32(pGpu, cmp90WriteTable[cmp90i].addr);
+                NV_PRINTF(LEVEL_ERROR,
+                          "CMP90_DEBUG: WRITE %s(0x%x) = 0x%08x (readback=0x%08x %s)\n",
+                          cmp90WriteTable[cmp90i].name,
+                          cmp90WriteTable[cmp90i].addr,
+                          cmp90WriteTable[cmp90i].value,
+                          rdBack,
+                          rdBack == cmp90WriteTable[cmp90i].value ? "OK" : "MISMATCH");
+            }
+
+            /* Restore WPR2 bounds */
+            GPU_REG_WR32(pGpu, 0x001fa824U, cmp90Wpr2Lo);
+            GPU_REG_WR32(pGpu, 0x001fa828U, cmp90Wpr2Hi);
+
+            NV_PRINTF(LEVEL_ERROR,
+                      "CMP90_DEBUG: Compute unlock complete for devId=0x%04x\n",
                       devId);
         }
 
