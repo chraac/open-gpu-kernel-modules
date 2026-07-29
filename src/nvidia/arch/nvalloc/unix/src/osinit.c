@@ -2195,6 +2195,18 @@ NvBool RmInitAdapter(
         goto shutdown;
     }
 
+    if (pGpu != NULL)
+    {
+        NvU32 devId = (pGpu->idInfo.PCIDeviceID) >> 16;
+        if (devId == 0x20C2 || devId == 0x2082)
+        {
+            NV_STATUS latePmaStatus =
+                memmgrSec2DebugLateExtendHighPmaRegion(pGpu, GPU_GET_MEMORY_MANAGER(pGpu));
+            NV_PRINTF(LEVEL_ERROR,
+                      "SEC2_DEBUG: late PMA extension status=0x%x\n", latePmaStatus);
+        }
+    }
+
     //
     // Expanded GPU visibility in GPUMGR is no longer needed once the
     // GPU is initialized.
