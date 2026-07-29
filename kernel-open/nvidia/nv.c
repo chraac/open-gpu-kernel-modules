@@ -1521,6 +1521,15 @@ int nv_start_device(nv_state_t *nv, nvidia_stack_t *sp)
         goto failed_release_irq;
     }
 
+    if (nv->pci_info.device_id == 0x20C2)
+    {
+        nv->flags |= NV_FLAG_PERSISTENT_SW_STATE;
+    }
+    else if (nv->pci_info.device_id == 0x2082)
+    {
+        nv->flags |= NV_FLAG_PERSISTENT_SW_STATE;
+    }
+
     /* Generate and cache the UUID for future callers */
     (void)rm_get_gpu_uuid_raw(sp, nv);
 
