@@ -220,6 +220,16 @@ kbusSetupDefaultBar0Window
     else
     {
         offsetBar0 = (pMemoryManager->Ram.fbAddrSpaceSizeMb << 20) - DRF_SIZE(NV_PRAMIN);
+
+        {
+            NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
+            if ((devId == 0x20C2 || devId == 0x2082) &&
+                pMemoryManager->Ram.fbAddrSpaceSizeMb > 0x2000)
+            {
+                NvU64 stockOffset = (0x2000ULL << 20) - DRF_SIZE(NV_PRAMIN);
+                offsetBar0 = stockOffset;
+            }
+        }
     }
 
     //
