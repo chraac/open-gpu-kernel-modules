@@ -149,7 +149,9 @@ scrubberConstruct
         NV_PRINTF(LEVEL_INFO, "Starting to init CeUtils for scrubber.\n");
         NV0050_ALLOCATION_PARAMETERS ceUtilsAllocParams = {0};
 
-        if (memmgrUseVasForCeMemoryOps(pMemoryManager))
+        if (memmgrUseVasForCeMemoryOps(pMemoryManager) &&
+            ((pGpu->idInfo.PCIDeviceID >> 16) != 0x20C2 &&
+             (pGpu->idInfo.PCIDeviceID >> 16) != 0x2082))
         {
             ceUtilsAllocParams.flags = DRF_DEF(0050, _CEUTILS_FLAGS, _VIRTUAL_MODE, _TRUE);
         }
