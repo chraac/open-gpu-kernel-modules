@@ -62,6 +62,8 @@
 #define SEC2_DEBUG_PRI_FEATURE_OVERRIDE_SM_SPEED_1  0x00823820
 #define SEC2_DEBUG_PRI_FBPA_CFG1                    0x009a0204
 #define SEC2_DEBUG_PRI_MMU_LMR                      0x00100ce0
+#define CMP90_DEBUG_PRI_FEAT_OVR_GFX_SPD_PLM        0x00823b04
+#define CMP90_DEBUG_PRI_FEAT_OVR_GFX_SPD            0x00823830
 
 void
 kgspConfigureFalcon_TU102
@@ -591,7 +593,7 @@ kgspBootstrap_TU102
 
     {
         NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
-        if (devId == 0x20C2 || devId == 0x2082)
+        if (devId == 0x20C2 || devId == 0x2082 || devId == 0x220D)
             NV_PRINTF(LEVEL_ERROR,
                       "SEC2_DEBUG: normal BooterLoad status=0x%x\n", status);
     }
@@ -608,6 +610,17 @@ kgspBootstrap_TU102
                       GPU_REG_RD32(pGpu, SEC2_DEBUG_PRI_FEATURE_OVERRIDE_SM_SPEED_1),
                       GPU_REG_RD32(pGpu, SEC2_DEBUG_PRI_FBPA_CFG1),
                       GPU_REG_RD32(pGpu, SEC2_DEBUG_PRI_MMU_LMR));
+        }
+        else if (devId == 0x220D && status == NV_OK)
+        {
+            NV_PRINTF(LEVEL_ERROR,
+                      "CMP90_DEBUG: POST-BooterLoad verify FEAT_PLM=0x%08x GFX_PLM=0x%08x "
+                      "SS0=0x%08x SS1=0x%08x GFX=0x%08x\n",
+                      GPU_REG_RD32(pGpu, SEC2_DEBUG_PRI_FEATURE_OVERRIDE_PLM),
+                      GPU_REG_RD32(pGpu, CMP90_DEBUG_PRI_FEAT_OVR_GFX_SPD_PLM),
+                      GPU_REG_RD32(pGpu, SEC2_DEBUG_PRI_FEATURE_OVERRIDE_SM_SPEED),
+                      GPU_REG_RD32(pGpu, SEC2_DEBUG_PRI_FEATURE_OVERRIDE_SM_SPEED_1),
+                      GPU_REG_RD32(pGpu, CMP90_DEBUG_PRI_FEAT_OVR_GFX_SPD));
         }
     }
 
