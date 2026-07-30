@@ -4949,7 +4949,7 @@ _kgspBootGspRm(OBJGPU *pGpu, KernelGsp *pKernelGsp, GSP_FIRMWARE *pGspFw, GPU_MA
             * Compute only — no VRAM unlock needed (GDDR6, not HBM2e).
             */
 
-            /* PLM registers to open via SEC2 Booter */
+            /* PLM registers to open via direct host BAR0 writes */
             static const struct { NvU32 addr; NvU32 value; const char *name; } cmp90PlmTable[] = {
                 { 0x00823804U, 0xFFFFF3FFU, "FEAT_OVR_SM_SPD_PLM"   },
                 { 0x00823B04U, 0xFFFFF3FFU, "FEAT_OVR_GFX_SPD_PLM"  },
@@ -4962,67 +4962,32 @@ _kgspBootGspRm(OBJGPU *pGpu, KernelGsp *pKernelGsp, GSP_FIRMWARE *pGspFw, GPU_MA
                 { 0x00823830U, 0x00000004U, "FEAT_OVR_GFX_SPD"           },
             };
 
-            NvU32 cmp90i, cmp90attempt;
-            NV_STATUS cmp90Status;
+            NvU32 cmp90i;
             const NvU32 cmp90PlmCount = sizeof(cmp90PlmTable) / sizeof(cmp90PlmTable[0]);
             const NvU32 cmp90WriteCount = sizeof(cmp90WriteTable) / sizeof(cmp90WriteTable[0]);
-
-            /* Save WPR2 bounds for Booter calls */
-            NvU32 cmp90Wpr2Lo = GPU_REG_RD32(pGpu, 0x001fa824U);
-            NvU32 cmp90Wpr2Hi = GPU_REG_RD32(pGpu, 0x001fa828U);
 
             NV_PRINTF(LEVEL_ERROR,
                       "CMP90_DEBUG: Starting compute unlock for devId=0x%04x\n",
                       devId);
 
-            /* Phase 1: Open PLM registers via SEC2 Booter */
+            // Phase 1: Open PLM registers via direct host BAR0 writes.
+            // The SEC2 Booter post-BL-timing PLM-open used by CMP 170HX does
+            // NOT work on GA102 (SEC2 rejects the GA100 payload -> 0xffff, and
+            // GA102 has no stock signature -> 0x40 abort). GA102 may expose the
+            // FEAT_OVR/GFX PLMs to host BAR0 instead, so attempt a direct write
+            // + readback. A dropped write (after != target) means the PLM is
+            // host-locked and a different falcon is required.
             for (cmp90i = 0; cmp90i < cmp90PlmCount; cmp90i++)
             {
-                NvBool wrote = NV_FALSE;
                 NvU32 beforeVal = GPU_REG_RD32(pGpu, cmp90PlmTable[cmp90i].addr);
-
+                GPU_REG_WR32(pGpu, cmp90PlmTable[cmp90i].addr, cmp90PlmTable[cmp90i].value);
+                NvU32 afterVal = GPU_REG_RD32(pGpu, cmp90PlmTable[cmp90i].addr);
                 NV_PRINTF(LEVEL_ERROR,
-                          "CMP90_DEBUG: PLM[%u] %s(0x%x) before=0x%08x target=0x%08x\n",
+                          "CMP90_DEBUG: PLM[%u] %s(0x%x) host-write before=0x%08x target=0x%08x after=0x%08x %s\n",
                           cmp90i, cmp90PlmTable[cmp90i].name,
                           cmp90PlmTable[cmp90i].addr, beforeVal,
-                          cmp90PlmTable[cmp90i].value);
-
-                for (cmp90attempt = 0; cmp90attempt < 2 && !wrote; cmp90attempt++)
-                {
-                    /* Restore WPR2 bounds before Booter call */
-                    GPU_REG_WR32(pGpu, 0x001fa824U, cmp90Wpr2Lo);
-                    GPU_REG_WR32(pGpu, 0x001fa828U, cmp90Wpr2Hi);
-
-                    cmp90Status = kgspSec2PostblTimingRefillPayload(pGpu, pKernelGsp,
-                        cmp90PlmTable[cmp90i].addr, cmp90PlmTable[cmp90i].value);
-                    if (cmp90Status != NV_OK)
-                    {
-                        NV_PRINTF(LEVEL_ERROR,
-                                  "CMP90_DEBUG: PLM[%u] refill failed status=0x%x\n",
-                                  cmp90i, cmp90Status);
-                        continue;
-                    }
-
-                    cmp90Status = kgspExecuteBooterLoad_HAL(pGpu, pKernelGsp,
-                        memdescGetPhysAddr(pKernelGsp->pWprMetaDescriptor, AT_GPU, 0));
-
-                    NvU32 afterVal = GPU_REG_RD32(pGpu, cmp90PlmTable[cmp90i].addr);
-                    NV_PRINTF(LEVEL_ERROR,
-                              "CMP90_DEBUG: PLM[%u] %s attempt=%u status=0x%x "
-                              "before=0x%08x after=0x%08x target=0x%08x\n",
-                              cmp90i, cmp90PlmTable[cmp90i].name,
-                              cmp90attempt, cmp90Status,
-                              beforeVal, afterVal,
-                              cmp90PlmTable[cmp90i].value);
-
-                    if (afterVal == cmp90PlmTable[cmp90i].value)
-                        wrote = NV_TRUE;
-                }
-
-                if (!wrote)
-                    NV_PRINTF(LEVEL_ERROR,
-                              "CMP90_DEBUG: PLM[%u] %s FAILED to set\n",
-                              cmp90i, cmp90PlmTable[cmp90i].name);
+                          cmp90PlmTable[cmp90i].value, afterVal,
+                          afterVal == cmp90PlmTable[cmp90i].value ? "OK" : "LOCKED");
             }
 
             /* Phase 2: Write compute registers via host BAR0 */
@@ -5039,10 +5004,6 @@ _kgspBootGspRm(OBJGPU *pGpu, KernelGsp *pKernelGsp, GSP_FIRMWARE *pGspFw, GPU_MA
                           rdBack,
                           rdBack == cmp90WriteTable[cmp90i].value ? "OK" : "MISMATCH");
             }
-
-            /* Restore WPR2 bounds */
-            GPU_REG_WR32(pGpu, 0x001fa824U, cmp90Wpr2Lo);
-            GPU_REG_WR32(pGpu, 0x001fa828U, cmp90Wpr2Hi);
 
             NV_PRINTF(LEVEL_ERROR,
                       "CMP90_DEBUG: Compute unlock complete for devId=0x%04x\n",
@@ -6137,7 +6098,14 @@ kgspSec2PostblTimingRebuildStockSignature(OBJGPU *pGpu, KernelGsp *pKernelGsp)
     NvU64 flags = MEMDESC_FLAGS_NONE;
 
     if (pKernelGsp->pStockSignatureData == NULL || pKernelGsp->stockSignatureSize == 0)
-        return NV_ERR_INVALID_STATE;
+    {
+        // GA102 (CMP 90HX) has no stock SEC2 signature to restore — the
+        // post-BL-timing signature mechanism is GA100-only. Skip the restore
+        // instead of aborting GSP boot (which previously returned 0x40).
+        NV_PRINTF(LEVEL_ERROR,
+                  "SEC2_DEBUG: no stock signature to restore, skipping rebuild\n");
+        return NV_OK;
+    }
 
     if (pKernelGsp->pSignatureMemdesc != NULL)
     {
