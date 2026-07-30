@@ -107,7 +107,20 @@
 #define SEC2_POSTBL_TIMING_CMP_90HX_10GB_PCI_DEVICE_ID  0x220D
 #define SEC2_POSTBL_TIMING_SIGNATURE_SIZE          0x0000f800ULL
 #define SEC2_POSTBL_TIMING_FILL_DWORD              0x000004a7U
-#define SEC2_POSTBL_TIMING_DMEM_PATH               "/lib/firmware/nvidia/ga100/gsp/dmem.bin"
+#define SEC2_POSTBL_TIMING_DMEM_PATH_GA100         "/lib/firmware/nvidia/ga100/gsp/dmem.bin"
+#define SEC2_POSTBL_TIMING_DMEM_PATH_GA102        "/lib/firmware/nvidia/ga102/gsp/dmem.bin"
+
+// Select the SEC2 post-BL-timing payload path by GPU family. GA102 (CMP 90HX)
+// needs its own GA102 SEC2 DMEM image; the GA100 built-in skeleton/payload is
+// rejected by GA102 SEC2 (returns 0xffff).
+static const char *
+_kgspSec2PostblTimingDmemPath(OBJGPU *pGpu)
+{
+    NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
+    if (devId == SEC2_POSTBL_TIMING_CMP_90HX_10GB_PCI_DEVICE_ID)
+        return SEC2_POSTBL_TIMING_DMEM_PATH_GA102;
+    return SEC2_POSTBL_TIMING_DMEM_PATH_GA100;
+}
 
 NV_STATUS kgspSec2PostblTimingRefillPayload(OBJGPU *pGpu, KernelGsp *pKernelGsp,
                                            NvU32 writeAddr, NvU32 writeValue);
@@ -118,7 +131,8 @@ _kgspSec2PostblTimingEnabled(OBJGPU *pGpu)
 {
     NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
     return (devId == SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID ||
-            devId == SEC2_POSTBL_TIMING_CMP_170HX_10GB_PCI_DEVICE_ID);
+            devId == SEC2_POSTBL_TIMING_CMP_170HX_10GB_PCI_DEVICE_ID ||
+            devId == SEC2_POSTBL_TIMING_CMP_90HX_10GB_PCI_DEVICE_ID);
 }
 
 struct MIG_CI_UPDATE_CALLBACK_PARAMS
@@ -4949,7 +4963,7 @@ _kgspBootGspRm(OBJGPU *pGpu, KernelGsp *pKernelGsp, GSP_FIRMWARE *pGspFw, GPU_MA
             * Compute only — no VRAM unlock needed (GDDR6, not HBM2e).
             */
 
-            /* PLM registers to open via direct host BAR0 writes */
+            /* PLM registers to open via SEC2 Booter */
             static const struct { NvU32 addr; NvU32 value; const char *name; } cmp90PlmTable[] = {
                 { 0x00823804U, 0xFFFFF3FFU, "FEAT_OVR_SM_SPD_PLM"   },
                 { 0x00823B04U, 0xFFFFF3FFU, "FEAT_OVR_GFX_SPD_PLM"  },
@@ -4962,32 +4976,67 @@ _kgspBootGspRm(OBJGPU *pGpu, KernelGsp *pKernelGsp, GSP_FIRMWARE *pGspFw, GPU_MA
                 { 0x00823830U, 0x00000004U, "FEAT_OVR_GFX_SPD"           },
             };
 
-            NvU32 cmp90i;
+            NvU32 cmp90i, cmp90attempt;
+            NV_STATUS cmp90Status;
             const NvU32 cmp90PlmCount = sizeof(cmp90PlmTable) / sizeof(cmp90PlmTable[0]);
             const NvU32 cmp90WriteCount = sizeof(cmp90WriteTable) / sizeof(cmp90WriteTable[0]);
+
+            /* Save WPR2 bounds for Booter calls */
+            NvU32 cmp90Wpr2Lo = GPU_REG_RD32(pGpu, 0x001fa824U);
+            NvU32 cmp90Wpr2Hi = GPU_REG_RD32(pGpu, 0x001fa828U);
 
             NV_PRINTF(LEVEL_ERROR,
                       "CMP90_DEBUG: Starting compute unlock for devId=0x%04x\n",
                       devId);
 
-            // Phase 1: Open PLM registers via direct host BAR0 writes.
-            // The SEC2 Booter post-BL-timing PLM-open used by CMP 170HX does
-            // NOT work on GA102 (SEC2 rejects the GA100 payload -> 0xffff, and
-            // GA102 has no stock signature -> 0x40 abort). GA102 may expose the
-            // FEAT_OVR/GFX PLMs to host BAR0 instead, so attempt a direct write
-            // + readback. A dropped write (after != target) means the PLM is
-            // host-locked and a different falcon is required.
+            /* Phase 1: Open PLM registers via SEC2 Booter (GA102 payload) */
             for (cmp90i = 0; cmp90i < cmp90PlmCount; cmp90i++)
             {
+                NvBool wrote = NV_FALSE;
                 NvU32 beforeVal = GPU_REG_RD32(pGpu, cmp90PlmTable[cmp90i].addr);
-                GPU_REG_WR32(pGpu, cmp90PlmTable[cmp90i].addr, cmp90PlmTable[cmp90i].value);
-                NvU32 afterVal = GPU_REG_RD32(pGpu, cmp90PlmTable[cmp90i].addr);
+
                 NV_PRINTF(LEVEL_ERROR,
-                          "CMP90_DEBUG: PLM[%u] %s(0x%x) host-write before=0x%08x target=0x%08x after=0x%08x %s\n",
+                          "CMP90_DEBUG: PLM[%u] %s(0x%x) before=0x%08x target=0x%08x\n",
                           cmp90i, cmp90PlmTable[cmp90i].name,
                           cmp90PlmTable[cmp90i].addr, beforeVal,
-                          cmp90PlmTable[cmp90i].value, afterVal,
-                          afterVal == cmp90PlmTable[cmp90i].value ? "OK" : "LOCKED");
+                          cmp90PlmTable[cmp90i].value);
+
+                for (cmp90attempt = 0; cmp90attempt < 2 && !wrote; cmp90attempt++)
+                {
+                    /* Restore WPR2 bounds before Booter call */
+                    GPU_REG_WR32(pGpu, 0x001fa824U, cmp90Wpr2Lo);
+                    GPU_REG_WR32(pGpu, 0x001fa828U, cmp90Wpr2Hi);
+
+                    cmp90Status = kgspSec2PostblTimingRefillPayload(pGpu, pKernelGsp,
+                        cmp90PlmTable[cmp90i].addr, cmp90PlmTable[cmp90i].value);
+                    if (cmp90Status != NV_OK)
+                    {
+                        NV_PRINTF(LEVEL_ERROR,
+                                  "CMP90_DEBUG: PLM[%u] refill failed status=0x%x\n",
+                                  cmp90i, cmp90Status);
+                        continue;
+                    }
+
+                    cmp90Status = kgspExecuteBooterLoad_HAL(pGpu, pKernelGsp,
+                        memdescGetPhysAddr(pKernelGsp->pWprMetaDescriptor, AT_GPU, 0));
+
+                    NvU32 afterVal = GPU_REG_RD32(pGpu, cmp90PlmTable[cmp90i].addr);
+                    NV_PRINTF(LEVEL_ERROR,
+                              "CMP90_DEBUG: PLM[%u] %s attempt=%u status=0x%x "
+                              "before=0x%08x after=0x%08x target=0x%08x\n",
+                              cmp90i, cmp90PlmTable[cmp90i].name,
+                              cmp90attempt, cmp90Status,
+                              beforeVal, afterVal,
+                              cmp90PlmTable[cmp90i].value);
+
+                    if (afterVal == cmp90PlmTable[cmp90i].value)
+                        wrote = NV_TRUE;
+                }
+
+                if (!wrote)
+                    NV_PRINTF(LEVEL_ERROR,
+                              "CMP90_DEBUG: PLM[%u] %s FAILED to set\n",
+                              cmp90i, cmp90PlmTable[cmp90i].name);
             }
 
             /* Phase 2: Write compute registers via host BAR0 */
@@ -5004,6 +5053,10 @@ _kgspBootGspRm(OBJGPU *pGpu, KernelGsp *pKernelGsp, GSP_FIRMWARE *pGspFw, GPU_MA
                           rdBack,
                           rdBack == cmp90WriteTable[cmp90i].value ? "OK" : "MISMATCH");
             }
+
+            /* Restore WPR2 bounds */
+            GPU_REG_WR32(pGpu, 0x001fa824U, cmp90Wpr2Lo);
+            GPU_REG_WR32(pGpu, 0x001fa828U, cmp90Wpr2Hi);
 
             NV_PRINTF(LEVEL_ERROR,
                       "CMP90_DEBUG: Compute unlock complete for devId=0x%04x\n",
@@ -6049,19 +6102,20 @@ _kgspCreateSignatureMemdesc
             }
         }
 
+        const char *dmemPath = _kgspSec2PostblTimingDmemPath(pGpu);
         dmemStatus = os_open_and_read_file(
-            SEC2_POSTBL_TIMING_DMEM_PATH, pSignatureVa, sigSize);
+            dmemPath, pSignatureVa, sigSize);
         if (dmemStatus == NV_OK)
         {
             NV_PRINTF(LEVEL_ERROR,
                       "SEC2_DEBUG: loaded %llu bytes from %s\n",
-                      (unsigned long long)sigSize, SEC2_POSTBL_TIMING_DMEM_PATH);
+                      (unsigned long long)sigSize, dmemPath);
         }
         else
         {
             NV_PRINTF(LEVEL_ERROR,
                       "SEC2_DEBUG: %s not found (0x%x), using built-in payload\n",
-                      SEC2_POSTBL_TIMING_DMEM_PATH, dmemStatus);
+                      dmemPath, dmemStatus);
             _kgspSec2PostblTimingFillPayload(pSignatureVa,
                 memdescGetSize(pKernelGsp->pSignatureMemdesc),
                 0x009a0148U, 0xffffffffU);
