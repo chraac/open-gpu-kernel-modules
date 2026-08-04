@@ -4344,7 +4344,8 @@ memmgrInitCeUtils_IMPL
         IS_SILICON(pGpu) && !pMemorySystemConfig->bDisableCompbitBacking &&
         (pMemorySystemConfig->bUseRawModeComptaglineAllocation || pMemorySystemConfig->bOneToOneComptagLineAllocation) &&
         ((pGpu->idInfo.PCIDeviceID >> 16) != 0x20C2 &&
-         (pGpu->idInfo.PCIDeviceID >> 16) != 0x2082))
+         (pGpu->idInfo.PCIDeviceID >> 16) != 0x2082 &&
+         (pGpu->idInfo.PCIDeviceID >> 16) != 0x220D))
     {
         // Turn on virtual mode to enable compressed allocation access
         ceUtilsParams.flags |= DRF_DEF(0050_CEUTILS, _FLAGS, _VIRTUAL_MODE, _TRUE);

@@ -591,14 +591,14 @@ kgspBootstrap_TU102
 
     {
         NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
-        if (devId == 0x20C2 || devId == 0x2082)
+        if (devId == 0x20C2 || devId == 0x2082 || devId == 0x220D)
             NV_PRINTF(LEVEL_ERROR,
                       "SEC2_DEBUG: normal BooterLoad status=0x%x\n", status);
     }
 
     {
         NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
-        if ((devId == 0x20C2 || devId == 0x2082) && status == NV_OK)
+        if ((devId == 0x20C2 || devId == 0x2082 || devId == 0x220D) && status == NV_OK)
         {
             NV_PRINTF(LEVEL_ERROR,
                       "SEC2_DEBUG: POST-BooterLoad verify PLM=0x%08x SS0=0x%08x SS1=0x%08x "
@@ -614,7 +614,7 @@ kgspBootstrap_TU102
 
     {
         NvU32 lateDevId = pGpu->idInfo.PCIDeviceID >> 16;
-        if ((lateDevId == 0x20C2 || lateDevId == 0x2082) && status == NV_OK)
+        if ((lateDevId == 0x20C2 || lateDevId == 0x2082 || lateDevId == 0x220D) && status == NV_OK)
         {
             #define PCIE_GEN2_PRIV_MISC_1_ADDR_LATE     0x0008841cU
             #define PCIE_GEN2_PRIV_MISC_1_GEN2_EN_LATE  ((1U << 11) | (1U << 13))

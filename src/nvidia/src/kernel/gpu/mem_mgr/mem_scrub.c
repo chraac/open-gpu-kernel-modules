@@ -151,7 +151,8 @@ scrubberConstruct
 
         if (memmgrUseVasForCeMemoryOps(pMemoryManager) &&
             ((pGpu->idInfo.PCIDeviceID >> 16) != 0x20C2 &&
-             (pGpu->idInfo.PCIDeviceID >> 16) != 0x2082))
+             (pGpu->idInfo.PCIDeviceID >> 16) != 0x2082 &&
+             (pGpu->idInfo.PCIDeviceID >> 16) != 0x220D))
         {
             ceUtilsAllocParams.flags = DRF_DEF(0050, _CEUTILS_FLAGS, _VIRTUAL_MODE, _TRUE);
         }

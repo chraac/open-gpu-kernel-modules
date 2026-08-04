@@ -108,6 +108,16 @@
 #define SEC2_POSTBL_TIMING_FILL_DWORD              0x000004a7U
 #define SEC2_POSTBL_TIMING_DMEM_PATH               "/lib/firmware/nvidia/ga100/gsp/dmem.bin"
 
+#define CMP90_PCI_DEVICE_ID                    0x220D
+#define CMP90_DMEM_PATH                        "/lib/firmware/nvidia/ga102/gsp/dmem.bin"
+#define CMP90_PCIE_LINK_SPEED                  0x0008c040U
+#define CMP90_PCIE_LINK_SPEED_GEN3             0x00000003U
+#define CMP90_PCIE_LINK_SPEED_GEN4             0x00000004U
+#define CMP90_PCIE_FUSE_OVERRIDE               0x00823810U
+#define CMP90_PCIE_FUSE_OVERRIDE_VALUE         0x00000000U
+#define CMP90_PCIE_LINK_CONTROL                0x0008c000U
+#define CMP90_PCIE_LINK_CONTROL_GEN3           0x00000003U
+
 NV_STATUS kgspSec2PostblTimingRefillPayload(OBJGPU *pGpu, KernelGsp *pKernelGsp,
                                            NvU32 writeAddr, NvU32 writeValue);
 NV_STATUS kgspSec2PostblTimingRebuildStockSignature(OBJGPU *pGpu, KernelGsp *pKernelGsp);
@@ -117,7 +127,8 @@ _kgspSec2PostblTimingEnabled(OBJGPU *pGpu)
 {
     NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
     return (devId == SEC2_POSTBL_TIMING_CMP_170HX_8GB_PCI_DEVICE_ID ||
-            devId == SEC2_POSTBL_TIMING_CMP_170HX_10GB_PCI_DEVICE_ID);
+            devId == SEC2_POSTBL_TIMING_CMP_170HX_10GB_PCI_DEVICE_ID ||
+            devId == CMP90_PCI_DEVICE_ID);
 }
 
 struct MIG_CI_UPDATE_CALLBACK_PARAMS
@@ -4913,7 +4924,6 @@ _kgspBootGspRm(OBJGPU *pGpu, KernelGsp *pKernelGsp, GSP_FIRMWARE *pGspFw, GPU_MA
                   GPU_REG_RD32(pGpu, 0x001fa7ccU));
 
         {
-            NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
             NvU32 cfg1Value;
             NvU32 lmrValue;
 
@@ -4930,8 +4940,11 @@ _kgspBootGspRm(OBJGPU *pGpu, KernelGsp *pKernelGsp, GSP_FIRMWARE *pGspFw, GPU_MA
 
             GPU_REG_WR32(pGpu, 0x0082381cU, 0x88888888U);
             GPU_REG_WR32(pGpu, 0x00823820U, 0x00000008U);
-            GPU_REG_WR32(pGpu, 0x009a0204U, cfg1Value);
-            GPU_REG_WR32(pGpu, 0x00100ce0U, lmrValue);
+
+            if (devId != CMP90_PCI_DEVICE_ID) {
+                GPU_REG_WR32(pGpu, 0x009a0204U, cfg1Value);
+                GPU_REG_WR32(pGpu, 0x00100ce0U, lmrValue);
+            }
 
             NV_PRINTF(LEVEL_ERROR,
                       "SEC2_DEBUG: POST-WRITE SS0=0x%08x SS1=0x%08x "

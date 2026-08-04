@@ -1617,6 +1617,11 @@ int nv_start_device(nv_state_t *nv, nvidia_stack_t *sp)
 
     nv_cmp170hx_retrain_gen2(nv);
 
+    if (nv->pci_info.device_id == 0x220D)
+    {
+        nv->flags |= NV_FLAG_PERSISTENT_SW_STATE;
+    }
+
     /* Generate and cache the UUID for future callers */
     (void)rm_get_gpu_uuid_raw(sp, nv);
 

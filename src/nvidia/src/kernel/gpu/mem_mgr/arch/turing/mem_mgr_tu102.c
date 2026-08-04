@@ -578,7 +578,8 @@ memmgrGetPteKindForScrubber_TU102
     pGpu = ENG_GET_GPU(pMemoryManager);
     if (pGpu != NULL &&
         ((pGpu->idInfo.PCIDeviceID >> 16) == 0x20C2 ||
-         (pGpu->idInfo.PCIDeviceID >> 16) == 0x2082))
+         (pGpu->idInfo.PCIDeviceID >> 16) == 0x2082 || 
+         (pGpu->idInfo.PCIDeviceID >> 16) == 0x220D))
     {
         *pteKind = NV_MMU_PTE_KIND_GENERIC_MEMORY;
         return;
