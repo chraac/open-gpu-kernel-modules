@@ -39,6 +39,26 @@
 #include "published/turing/tu102/dev_gc6_island.h"
 #include "published/turing/tu102/dev_gc6_island_addendum.h"
 
+#define CMP90_FRTS_DIAG_PCI_DEVICE_ID           0x220DU
+#define CMP90_FRTS_DIAG_PCI_DEVICE_ID_FULL      0x220D10DEU
+#define CMP90_FRTS_DIAG_PCI_SUBDEVICE_ID        0x155510DEU
+#define CMP90_FRTS_DIAG_FEAT_OVR_PLM            0x00823804U
+
+static NvBool
+_kgspCmp90FrtsDiagIsExactTarget
+(
+    OBJGPU *pGpu
+)
+{
+    NvU32 pciDeviceId = pGpu->idInfo.PCIDeviceID;
+
+    return (((pciDeviceId == CMP90_FRTS_DIAG_PCI_DEVICE_ID_FULL) ||
+             ((pciDeviceId >> 16) == CMP90_FRTS_DIAG_PCI_DEVICE_ID) ||
+             (pciDeviceId == CMP90_FRTS_DIAG_PCI_DEVICE_ID)) &&
+            (pGpu->idInfo.PCISubDeviceID ==
+             CMP90_FRTS_DIAG_PCI_SUBDEVICE_ID));
+}
+
 /*!
  * Get size of FRTS data.
  *
@@ -493,9 +513,40 @@ kgspExecuteFwsec_TU102
         NvU32 wpr2HiVal;
         NvU32 wpr2LoVal;
         NvU32 expectedLoVal;
+        NvBool bCmp90ExactTarget = _kgspCmp90FrtsDiagIsExactTarget(pGpu);
+        NvU32 wpr2HiRaw = 0xffffffffU;
+        NvU32 wpr2LoRaw = 0xffffffffU;
+        NvU32 expectedLoValDiag = 0xffffffffU;
+        NvU32 featPlm = 0xffffffffU;
 
         data = GPU_REG_RD32(pGpu, NV_PBUS_VBIOS_SCRATCH(NV_VBIOS_FWSECLIC_SCRATCH_INDEX_0E));
         frtsErrCode = DRF_VAL(_VBIOS, _FWSECLIC, _FRTS_ERR_CODE, data);
+        if (bCmp90ExactTarget)
+        {
+            expectedLoValDiag = (NvU32)
+                (pPreparedCmd->frtsOffset >>
+                 NV_PFB_PRI_MMU_WPR2_ADDR_LO_ALIGNMENT);
+            wpr2HiRaw = GPU_REG_RD32(pGpu, NV_PFB_PRI_MMU_WPR2_ADDR_HI);
+            wpr2LoRaw = GPU_REG_RD32(pGpu, NV_PFB_PRI_MMU_WPR2_ADDR_LO);
+            featPlm = GPU_REG_RD32(pGpu, CMP90_FRTS_DIAG_FEAT_OVR_PLM);
+            NV_PRINTF(
+                LEVEL_ERROR,
+                "CMP90_STOCKFLOW_REJOIN9: FRTS_DIAG "
+                "scratch0e=0x%08x frts_err=0x%x "
+                "frts_offset=0x%016llx expected_lo=0x%08x "
+                "wpr2_lo_raw=0x%08x wpr2_lo=0x%08x "
+                "wpr2_hi_raw=0x%08x wpr2_hi=0x%08x "
+                "feat_plm=0x%08x\n",
+                data, frtsErrCode,
+                (unsigned long long)pPreparedCmd->frtsOffset,
+                expectedLoValDiag, wpr2LoRaw,
+                DRF_VAL(_PFB, _PRI_MMU_WPR2_ADDR_LO, _VAL,
+                    wpr2LoRaw),
+                wpr2HiRaw,
+                DRF_VAL(_PFB, _PRI_MMU_WPR2_ADDR_HI, _VAL,
+                    wpr2HiRaw),
+                featPlm);
+        }
         if (frtsErrCode != NV_VBIOS_FWSECLIC_FRTS_ERR_CODE_NONE)
         {
             NV_PRINTF(LEVEL_ERROR, "failed to execute FWSEC for FRTS: FRTS error code 0x%x\n", frtsErrCode);

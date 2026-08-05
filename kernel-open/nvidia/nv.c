@@ -1947,6 +1947,23 @@ static int nv_open_device(nv_state_t *nv, nvidia_stack_t *sp)
         }
 
         rc = nv_start_device(nv, sp);
+        if ((rc != 0) &&
+            (nv->pci_info.device_id == 0x220d) &&
+            (nv->subsystem_vendor == 0x10de) &&
+            (nv->subsystem_id == 0x1555) &&
+            !(nv->flags & NV_FLAG_INITIALIZED))
+        {
+            NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
+                          "CMP90_STOCKFLOW_REJOIN14: retrying nv_start_device "
+                          "after selector handoff FLR rc=%d flags=0x%x\n",
+                          rc, nv->flags);
+            os_delay(6000);
+            rc = nv_start_device(nv, sp);
+            NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
+                          "CMP90_STOCKFLOW_REJOIN14: nv_start_device retry "
+                          "completed rc=%d flags=0x%x\n",
+                          rc, nv->flags);
+        }
         if (rc != 0)
             return rc;
     }
