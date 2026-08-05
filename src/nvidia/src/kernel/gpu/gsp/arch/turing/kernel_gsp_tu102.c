@@ -611,6 +611,44 @@ kgspBootstrap_TU102
         }
     }
 
+
+    {
+        NvU32 lateDevId = pGpu->idInfo.PCIDeviceID >> 16;
+        if ((lateDevId == 0x20C2 || lateDevId == 0x2082) && status == NV_OK)
+        {
+            #define PCIE_GEN2_PRIV_MISC_1_ADDR_LATE     0x0008841cU
+            #define PCIE_GEN2_PRIV_MISC_1_GEN2_EN_LATE  ((1U << 11) | (1U << 13))
+            #define PCIE_GEN2_PRIV_MISC_1_GEN2_VAL_LATE ((1U << 12) | (1U << 14))
+            NvU32 misc1Late = GPU_REG_RD32(pGpu, PCIE_GEN2_PRIV_MISC_1_ADDR_LATE);
+            NvU32 misc1WantLate = (misc1Late | PCIE_GEN2_PRIV_MISC_1_GEN2_EN_LATE)
+                                  & ~PCIE_GEN2_PRIV_MISC_1_GEN2_VAL_LATE;
+            GPU_REG_WR32(pGpu, PCIE_GEN2_PRIV_MISC_1_ADDR_LATE, misc1WantLate);
+            NV_PRINTF(LEVEL_ERROR,
+                      "SEC2_DEBUG: PCIe PRIV_MISC_1 late pre=0x%08x post=0x%08x\n",
+                      misc1Late,
+                      GPU_REG_RD32(pGpu, PCIE_GEN2_PRIV_MISC_1_ADDR_LATE));
+            {
+                NvU32 cyaLate = GPU_REG_RD32(pGpu, 0x0008c2c0U);
+                cyaLate = cyaLate & ~(1U << 2);
+                GPU_REG_WR32(pGpu, 0x0008c2c0U, cyaLate);
+                NV_PRINTF(LEVEL_ERROR,
+                          "SEC2_DEBUG: PCIe CYA_0 late clear DIS_G2: 0x%08x (bit2=%u)\n",
+                          GPU_REG_RD32(pGpu, 0x0008c2c0U),
+                          (GPU_REG_RD32(pGpu, 0x0008c2c0U) >> 2) & 1U);
+                NvU32 linkCfgLate = GPU_REG_RD32(pGpu, 0x0008c040U);
+                linkCfgLate = (linkCfgLate & ~0x000C0000U) | (0x2U << 18);
+                GPU_REG_WR32(pGpu, 0x0008c040U, linkCfgLate);
+                NV_PRINTF(LEVEL_ERROR,
+                          "SEC2_DEBUG: PCIe LINK_CONFIG_0 late MAX_RATE=2: 0x%08x\n",
+                          GPU_REG_RD32(pGpu, 0x0008c040U));
+                GPU_REG_WR32(pGpu, 0x0008872cU, 0x00000006U);
+                NV_PRINTF(LEVEL_ERROR,
+                          "SEC2_DEBUG: PCIe XVE_OVR late=0x%08x\n",
+                          GPU_REG_RD32(pGpu, 0x0008872cU));
+            }
+        }
+    }
+
     if (status != NV_OK)
     {
         NV_PRINTF(LEVEL_ERROR, "failed to execute Booter Load (ucode for initial boot): 0x%x\n", status);
