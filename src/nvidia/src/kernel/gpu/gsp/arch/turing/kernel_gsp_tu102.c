@@ -65,6 +65,10 @@
 #define SEC2_DEBUG_PRI_FBPA_CFG1                    0x009a0204
 #define SEC2_DEBUG_PRI_MMU_LMR                      0x00100ce0
 
+#define CMP90_PC_EXACT_PCI_DEVICE_ID                0x220DU
+#define CMP90_PC_EXACT_PCI_DEVICE_ID_FULL           0x220D10DEU
+#define CMP90_PC_EXACT_PCI_SUBDEVICE_ID             0x155510DEU
+
 #include "events/gpu/ras/ras_events.h"
 #include "nvoc/event_bus.h"
 
@@ -1390,8 +1394,42 @@ kgspPrepareScrubberImageIfNeeded_TU102
 
     // WAR for Bug 5016200 - Always run scrubber from kernel RM for ADA config
     if ((neededSize > prescrubbedSize) || kgspIsScrubberImageSupported(pGpu, pKernelGsp))
-        NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
-            kgspAllocateScrubberUcodeImage(pGpu, pKernelGsp, &pKernelGsp->pScrubberUcode));
+    {
+        NV_STATUS scrubberStatus = kgspAllocateScrubberUcodeImage(
+            pGpu, pKernelGsp, &pKernelGsp->pScrubberUcode);
+        if (scrubberStatus != NV_OK)
+        {
+            NvU32 pciDeviceId = pGpu->idInfo.PCIDeviceID;
+            NvBool bCmp90ExactTarget =
+                (((pciDeviceId == CMP90_PC_EXACT_PCI_DEVICE_ID_FULL) ||
+                  ((pciDeviceId >> 16) == CMP90_PC_EXACT_PCI_DEVICE_ID) ||
+                  (pciDeviceId == CMP90_PC_EXACT_PCI_DEVICE_ID)) &&
+                 (pGpu->idInfo.PCISubDeviceID ==
+                  CMP90_PC_EXACT_PCI_SUBDEVICE_ID));
+
+            if (bCmp90ExactTarget)
+            {
+                NV_PRINTF(LEVEL_ERROR,
+                          "CMP90_STOCKFLOW_REJOIN9: SCRUBBER_ALLOC_FAIL "
+                          "status=0x%x needed=0x%llx prescrubbed=0x%llx "
+                          "supported=%u\n",
+                          scrubberStatus, neededSize, prescrubbedSize,
+                          kgspIsScrubberImageSupported(pGpu, pKernelGsp));
+                if ((scrubberStatus == NV_ERR_NOT_SUPPORTED) &&
+                    !kgspIsScrubberImageSupported(pGpu, pKernelGsp))
+                {
+                    pKernelGsp->pScrubberUcode = NULL;
+                    NV_PRINTF(LEVEL_ERROR,
+                              "CMP90_STOCKFLOW_REJOIN9: "
+                              "SCRUBBER_UNSUPPORTED_SKIP "
+                              "needed=0x%llx prescrubbed=0x%llx\n",
+                              neededSize, prescrubbedSize);
+                    return NV_OK;
+                }
+            }
+            return scrubberStatus;
+        }
+    }
 
     return NV_OK;
 }

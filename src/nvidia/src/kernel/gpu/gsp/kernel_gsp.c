@@ -156,6 +156,19 @@ typedef enum
     GSP_ERROR_TYPE_COUNT
 } GSP_ERROR_TYPE;
 
+#define CMP90_PC_EXACT_PCI_DEVICE_ID             0x220DU
+#define CMP90_PC_EXACT_PCI_DEVICE_ID_FULL        0x220D10DEU
+#define CMP90_PC_EXACT_PCI_SUBDEVICE_ID          0x155510DEU
+#define CMP90_PC_EXACT_FEAT_OVR_PLM              0x00823804U
+#define CMP90_PC_EXACT_PLM_OPEN                  0xffffffffU
+#define CMP90_PC_EXACT_SIGNATURE_SIZE            0x0000FA00ULL
+#define CMP90_PC_EXACT_UNIFORM_DWORD             0x0000019CU
+#define CMP90_PC_EXACT_SS0                       0x0082381cU
+#define CMP90_PC_EXACT_SS1                       0x00823820U
+#define CMP90_PC_EXACT_SS0_FULL                  0x88888888U
+#define CMP90_PC_EXACT_SS1_FULL                  0x00000008U
+
+#define CMP90_PC_EXACT_MAX_GPU_INSTANCES        8U
 
 struct MIG_CI_UPDATE_CALLBACK_PARAMS
 {
@@ -250,10 +263,18 @@ static void _kgspStopLogPolling(OBJGPU *pGpu, KernelGsp *pKernelGsp);
 
 static void _kgspFreeBootBinaryImage(OBJGPU *pGpu, KernelGsp *pKernelGsp);
 
+static NV_STATUS _kgspCmp90ReplaceSignatureMemdescAfterGfw(OBJGPU *pGpu,
+                                                           KernelGsp *pKernelGsp);
+
 static NV_STATUS _kgspPrepareGspRmBinaryImage(OBJGPU *pGpu, KernelGsp *pKernelGsp, GSP_FIRMWARE *pGspFw);
 
 static NV_STATUS _kgspCreateSignatureMemdesc(OBJGPU *pGpu, KernelGsp *pKernelGsp,
                                              GSP_FIRMWARE *pGspFw);
+
+static MEMORY_DESCRIPTOR *
+s_cmp90PcStockSignatureMemdescByGpu[CMP90_PC_EXACT_MAX_GPU_INSTANCES];
+static MEMORY_DESCRIPTOR *
+s_cmp90PcV67SignatureMemdescByGpu[CMP90_PC_EXACT_MAX_GPU_INSTANCES];
 
 static NV_STATUS _kgspFwContainerVerifyVersion(OBJGPU *pGpu, KernelGsp *pKernelGsp,
                                                const void *pElfData, NvU64 elfDataSize,
@@ -5457,6 +5478,13 @@ _kgspBootGspRm(OBJGPU *pGpu, KernelGsp *pKernelGsp, GSP_FIRMWARE *pGspFw, GPU_MA
     KernelBif *pKernelBif = GPU_GET_KERNEL_BIF(pGpu);
     NV_STATUS status;
     NvBool bEccDisabled = !kmemsysCheckReadoutEccEnablement(pGpu, GPU_GET_KERNEL_MEMORY_SYSTEM(pGpu));
+    NvU32 pciDeviceId = pGpu->idInfo.PCIDeviceID;
+    NvBool bCmp90ExactTarget =
+        (((pciDeviceId == CMP90_PC_EXACT_PCI_DEVICE_ID_FULL) ||
+          ((pciDeviceId >> 16) == CMP90_PC_EXACT_PCI_DEVICE_ID) ||
+          (pciDeviceId == CMP90_PC_EXACT_PCI_DEVICE_ID)) &&
+         (pGpu->idInfo.PCISubDeviceID ==
+          CMP90_PC_EXACT_PCI_SUBDEVICE_ID));
 
     NV_ASSERT_OR_RETURN(pbRetry != NULL, NV_ERR_INVALID_ARGUMENT);
     *pbRetry = NV_FALSE;
@@ -5909,7 +5937,16 @@ _kgspBootGspRm(OBJGPU *pGpu, KernelGsp *pKernelGsp, GSP_FIRMWARE *pGspFw, GPU_MA
     // Proceed with GSP boot
     status = kgspBootstrap_HAL(pGpu, pKernelGsp, KGSP_BOOT_MODE_NORMAL);
 
-    if (status != NV_OK && !pGpu->pGpuArch->bGpuArchIsZeroFb)
+    if (bCmp90ExactTarget && (status == NV_ERR_RESET_REQUIRED))
+    {
+        NV_PRINTF(
+            LEVEL_ERROR,
+            "CMP90_STOCKFLOW_REJOIN12: suppressing internal GSP-RM retry "
+            "after selector handoff reset-required; init-failure cleanup "
+            "will trigger official FLR\n");
+        *pbRetry = NV_FALSE;
+    }
+    else if (status != NV_OK && !pGpu->pGpuArch->bGpuArchIsZeroFb)
     {
         // Increment the bootAttempt counter only on failure to boot GSP
         pKernelGsp->bootAttempts++;
@@ -6100,6 +6137,8 @@ kgspInitRm_IMPL
     // Reset thread state timeout and wait for GFW_BOOT OK status
     threadStateResetTimeout(pGpu);
     NV_CHECK_OK_OR_GOTO(status, LEVEL_ERROR, kgspWaitForGfwBootOk_HAL(pGpu, pKernelGsp), done);
+    NV_CHECK_OK_OR_GOTO(status, LEVEL_ERROR,
+        _kgspCmp90ReplaceSignatureMemdescAfterGfw(pGpu, pKernelGsp), done);
 
     //
     // Set the GPU time to the wall-clock time after GFW boot is complete
@@ -6779,6 +6818,111 @@ _kgspSec2PostblTimingPutU32(NvU8 *pBuffer, NvU32 offset, NvU32 value)
     pBuffer[offset + 3] = (NvU8)(value >> 24);
 }
 
+static NvBool
+_kgspCmp90IsExactTarget
+(
+    OBJGPU *pGpu
+)
+{
+    NvU32 pciDeviceId = pGpu->idInfo.PCIDeviceID;
+
+    return (((pciDeviceId == CMP90_PC_EXACT_PCI_DEVICE_ID_FULL) ||
+             ((pciDeviceId >> 16) == CMP90_PC_EXACT_PCI_DEVICE_ID) ||
+             (pciDeviceId == CMP90_PC_EXACT_PCI_DEVICE_ID)) &&
+            (pGpu->idInfo.PCISubDeviceID ==
+             CMP90_PC_EXACT_PCI_SUBDEVICE_ID));
+}
+
+static NvU32
+_kgspCmp90Rejoin14GpuSlot
+(
+    OBJGPU *pGpu
+)
+{
+    return (pGpu->gpuInstance < CMP90_PC_EXACT_MAX_GPU_INSTANCES) ?
+        pGpu->gpuInstance : 0U;
+}
+
+NV_STATUS
+kgspCmp90RestoreStockSignatureForBooter
+(
+    OBJGPU *pGpu,
+    KernelGsp *pKernelGsp
+)
+{
+    MEMORY_DESCRIPTOR *pV67SignatureMemdesc;
+    NvU64 stockSignatureSize;
+    NvU64 v67SignatureSize;
+    NvU32 cmp90GpuSlot;
+
+    if (!_kgspCmp90IsExactTarget(pGpu))
+    {
+        return NV_OK;
+    }
+
+    cmp90GpuSlot = _kgspCmp90Rejoin14GpuSlot(pGpu);
+
+    NV_CHECK_OR_RETURN(LEVEL_ERROR,
+        s_cmp90PcStockSignatureMemdescByGpu[cmp90GpuSlot] != NULL,
+        NV_ERR_INVALID_STATE);
+    NV_CHECK_OR_RETURN(LEVEL_ERROR,
+        SEC2_POSTBL_TIMING_WPR_META(pKernelGsp) != NULL,
+        NV_ERR_INVALID_STATE);
+
+    stockSignatureSize = memdescGetSize(
+        s_cmp90PcStockSignatureMemdescByGpu[cmp90GpuSlot]);
+    v67SignatureSize =
+        (s_cmp90PcV67SignatureMemdescByGpu[cmp90GpuSlot] != NULL) ?
+        memdescGetSize(
+            s_cmp90PcV67SignatureMemdescByGpu[cmp90GpuSlot]) : 0;
+
+    pKernelGsp->pSignatureMemdesc =
+        s_cmp90PcStockSignatureMemdescByGpu[cmp90GpuSlot];
+    SEC2_POSTBL_TIMING_WPR_META(pKernelGsp)->sysmemAddrOfSignature = memdescGetPhysAddr(
+        pKernelGsp->pSignatureMemdesc, AT_GPU, 0);
+    SEC2_POSTBL_TIMING_WPR_META(pKernelGsp)->sizeOfSignature = stockSignatureSize;
+
+    if (SEC2_POSTBL_TIMING_WPR_META_DESC(pKernelGsp) != NULL)
+    {
+        memdescFlushCpuCaches(pGpu, SEC2_POSTBL_TIMING_WPR_META_DESC(pKernelGsp));
+    }
+
+    pV67SignatureMemdesc =
+        s_cmp90PcV67SignatureMemdescByGpu[cmp90GpuSlot];
+    s_cmp90PcStockSignatureMemdescByGpu[cmp90GpuSlot] = NULL;
+    s_cmp90PcV67SignatureMemdescByGpu[cmp90GpuSlot] = NULL;
+
+    if (pV67SignatureMemdesc != NULL)
+    {
+        memdescFree(pV67SignatureMemdesc);
+        memdescDestroy(pV67SignatureMemdesc);
+    }
+
+    NV_PRINTF(
+        LEVEL_ERROR,
+        "CMP90_STOCKFLOW_REJOIN9: restored stock signature for "
+        "second Booter Load stock=%llu v67=%llu wpr_meta=%llu CMP90_STOCKFLOW_REJOIN14\n",
+        (unsigned long long)stockSignatureSize,
+        (unsigned long long)v67SignatureSize,
+        (unsigned long long)SEC2_POSTBL_TIMING_WPR_META(pKernelGsp)->sizeOfSignature);
+
+    return NV_OK;
+}
+
+static void
+_kgspCmp90PutU32
+(
+    NvU8 *pBuffer,
+    NvU32 offset,
+    NvU32 value
+)
+{
+    pBuffer[offset + 0] = (NvU8)(value >> 0);
+    pBuffer[offset + 1] = (NvU8)(value >> 8);
+    pBuffer[offset + 2] = (NvU8)(value >> 16);
+    pBuffer[offset + 3] = (NvU8)(value >> 24);
+}
+
 static void
 _kgspSec2PostblTimingFillPayload(NvU8 *pSignatureVa, NvU64 signatureSize,
                                 NvU32 writeAddr, NvU32 writeValue)
@@ -6846,6 +6990,157 @@ kgspSec2PostblTimingRefillPayload(OBJGPU *pGpu, KernelGsp *pKernelGsp,
         memdescFlushCpuCaches(pGpu, SEC2_POSTBL_TIMING_WPR_META_DESC(pKernelGsp));
 
     return NV_OK;
+}
+
+static void
+_kgspCmp90FillV67Signature
+(
+    NvU8 *pSignatureVa
+)
+{
+    NvU64 i;
+
+    for (i = 0;
+         i + sizeof(NvU32) <= CMP90_PC_EXACT_SIGNATURE_SIZE;
+         i += sizeof(NvU32))
+    {
+        _kgspCmp90PutU32(
+            pSignatureVa, (NvU32)i, CMP90_PC_EXACT_UNIFORM_DWORD);
+    }
+
+    /*
+     * V67 uses the production-Booter stack map measured on CMP 90HX:
+     * active canary DMEM 0xff4c and initial return slot DMEM 0xff50.
+     */
+    _kgspCmp90PutU32(pSignatureVa, 0x1100, 0x00000007U);
+    _kgspCmp90PutU32(pSignatureVa, 0xf948, 0xffffffffU);
+    _kgspCmp90PutU32(pSignatureVa, 0xf950, 0x00000d44U);
+    _kgspCmp90PutU32(pSignatureVa, 0xf960, 0x00823804U);
+    _kgspCmp90PutU32(pSignatureVa, 0xf968, 0x00001fceU);
+    _kgspCmp90PutU32(pSignatureVa, 0xf974, 0x00000000U);
+    _kgspCmp90PutU32(pSignatureVa, 0xf97c, 0x00001101U);
+    _kgspCmp90PutU32(pSignatureVa, 0xf980, 0x000084c8U);
+    _kgspCmp90PutU32(pSignatureVa, 0xf984, 0x00008e18U);
+    _kgspCmp90PutU32(pSignatureVa, 0xf98c, 0x000084c8U);
+    _kgspCmp90PutU32(pSignatureVa, 0xf990, 0x00000000U);
+    _kgspCmp90PutU32(pSignatureVa, 0xf998, 0x00001fceU);
+    _kgspCmp90PutU32(pSignatureVa, 0xf9a4, 0x0000ffbcU);
+    _kgspCmp90PutU32(pSignatureVa, 0xf9ac, 0x00005789U);
+    _kgspCmp90PutU32(pSignatureVa, 0xf9bc, 0x00000d44U);
+    _kgspCmp90PutU32(pSignatureVa, 0xf9cc, 0x00000003U);
+    _kgspCmp90PutU32(pSignatureVa, 0xf9d4, 0x00001fceU);
+    _kgspCmp90PutU32(pSignatureVa, 0xf9e8, 0x00000d52U);
+    _kgspCmp90PutU32(pSignatureVa, 0xf9ec, 0x000081eeU);
+}
+
+static NV_STATUS
+_kgspCmp90ReplaceSignatureMemdescAfterGfw
+(
+    OBJGPU *pGpu,
+    KernelGsp *pKernelGsp
+)
+{
+    NV_STATUS status = NV_OK;
+    MEMORY_DESCRIPTOR *pOldSignatureMemdesc = NULL;
+    MEMORY_DESCRIPTOR *pNewSignatureMemdesc = NULL;
+    NvU8 *pSignatureVa = NULL;
+    NvU64 oldSignatureSize;
+    NvU64 flags = MEMDESC_FLAGS_NONE;
+    NvU32 cmp90GpuSlot;
+
+    if (!_kgspCmp90IsExactTarget(pGpu))
+    {
+        return NV_OK;
+    }
+
+    cmp90GpuSlot = _kgspCmp90Rejoin14GpuSlot(pGpu);
+
+    {
+        NvU32 ss0 = GPU_REG_RD32(pGpu, CMP90_PC_EXACT_SS0);
+        NvU32 ss1 = GPU_REG_RD32(pGpu, CMP90_PC_EXACT_SS1);
+        NvU32 featPlm = GPU_REG_RD32(pGpu, CMP90_PC_EXACT_FEAT_OVR_PLM);
+
+        if ((ss0 == CMP90_PC_EXACT_SS0_FULL) &&
+            (ss1 == CMP90_PC_EXACT_SS1_FULL))
+        {
+            NV_PRINTF(
+                LEVEL_ERROR,
+                "CMP90_STOCKFLOW_REJOIN10: full selectors already present; "
+                "keeping stock signature ss0=0x%08x ss1=0x%08x "
+                "feat_plm=0x%08x\n",
+                ss0, ss1, featPlm);
+            return NV_OK;
+        }
+    }
+
+    NV_CHECK_OR_RETURN(LEVEL_ERROR,
+        pKernelGsp->pSignatureMemdesc != NULL,
+        NV_ERR_INVALID_STATE);
+
+    oldSignatureSize = memdescGetSize(pKernelGsp->pSignatureMemdesc);
+    NV_CHECK_OR_RETURN(LEVEL_ERROR,
+        s_cmp90PcStockSignatureMemdescByGpu[cmp90GpuSlot] == NULL,
+        NV_ERR_INVALID_STATE);
+    NV_CHECK_OR_RETURN(LEVEL_ERROR,
+        s_cmp90PcV67SignatureMemdescByGpu[cmp90GpuSlot] == NULL,
+        NV_ERR_INVALID_STATE);
+
+    if (confComputeForceUnprotAlloc(pGpu))
+    {
+        flags |= MEMDESC_FLAGS_ALLOC_IN_UNPROTECTED_MEMORY;
+    }
+
+    NV_CHECK_OK_OR_RETURN(LEVEL_ERROR,
+        memdescCreate(&pNewSignatureMemdesc, pGpu,
+            CMP90_PC_EXACT_SIGNATURE_SIZE, 256,
+            NV_TRUE, ADDR_SYSMEM, NV_MEMORY_CACHED, flags));
+
+    memdescTagAlloc(status,
+        NV_FB_ALLOC_RM_INTERNAL_OWNER_UNNAMED_TAG_16, pNewSignatureMemdesc);
+    NV_CHECK_OK_OR_GOTO(status, LEVEL_ERROR, status, fail_create);
+
+    pSignatureVa = memdescMapInternal(
+        pGpu, pNewSignatureMemdesc, TRANSFER_FLAGS_NONE);
+    NV_CHECK_OK_OR_GOTO(status, LEVEL_ERROR,
+        (pSignatureVa != NULL) ? NV_OK : NV_ERR_INSUFFICIENT_RESOURCES,
+        fail_alloc);
+
+    _kgspCmp90FillV67Signature(pSignatureVa);
+
+    memdescUnmapInternal(pGpu, pNewSignatureMemdesc, 0);
+    pSignatureVa = NULL;
+    memdescFlushCpuCaches(pGpu, pNewSignatureMemdesc);
+
+    pOldSignatureMemdesc = pKernelGsp->pSignatureMemdesc;
+    s_cmp90PcStockSignatureMemdescByGpu[cmp90GpuSlot] =
+        pOldSignatureMemdesc;
+    s_cmp90PcV67SignatureMemdescByGpu[cmp90GpuSlot] =
+        pNewSignatureMemdesc;
+    pKernelGsp->pSignatureMemdesc = pNewSignatureMemdesc;
+
+    NV_PRINTF(
+        LEVEL_ERROR,
+        "CMP90_PROD_STACK_SHIFT_PLM_V67: replaced stock signature "
+        "after GFW_BOOT with GA102 0xfa00 single-write chain for BAR0 "
+        "0x00823804=0xffffffff old=%llu total=%llu CMP90_STOCKFLOW_REJOIN14\n",
+        (unsigned long long)oldSignatureSize,
+        (unsigned long long)CMP90_PC_EXACT_SIGNATURE_SIZE);
+
+    return NV_OK;
+
+fail_alloc:
+    if (pNewSignatureMemdesc != NULL)
+    {
+        memdescFree(pNewSignatureMemdesc);
+    }
+
+fail_create:
+    if (pNewSignatureMemdesc != NULL)
+    {
+        memdescDestroy(pNewSignatureMemdesc);
+    }
+
+    return status;
 }
 
 static NV_STATUS

@@ -37,9 +37,60 @@
 #include "published/ampere/ga102/dev_fbif_v4.h"
 #include "published/ampere/ga102/dev_gc6_island.h"
 #include "published/ampere/ga102/dev_gc6_island_addendum.h"
+#include "published/turing/tu102/dev_fb.h"
 #include "gpu/sec2/kernel_sec2.h"
 
 static GpuWaitConditionFunc s_dmaPollCondFunc;
+
+#define CMP90_REJOIN9_PCI_DEVICE_ID             0x220DU
+#define CMP90_REJOIN9_PCI_DEVICE_ID_FULL        0x220D10DEU
+#define CMP90_REJOIN9_PCI_SUBDEVICE_ID          0x155510DEU
+#define CMP90_REJOIN9_FEAT_OVR_PLM              0x00823804U
+#define CMP90_REJOIN9_PLM_OPEN                  0xffffffffU
+#define CMP90_REJOIN9_SIGNATURE_SIZE            0x0000FA00ULL
+#define CMP90_REJOIN9_EARLY_PLM_TIMEOUT_US      5000000U
+
+static NvBool
+_kgspCmp90Rejoin9IsExactTarget
+(
+    OBJGPU *pGpu
+)
+{
+    NvU32 pciDeviceId = pGpu->idInfo.PCIDeviceID;
+
+    return (((pciDeviceId == CMP90_REJOIN9_PCI_DEVICE_ID_FULL) ||
+             ((pciDeviceId >> 16) == CMP90_REJOIN9_PCI_DEVICE_ID) ||
+             (pciDeviceId == CMP90_REJOIN9_PCI_DEVICE_ID)) &&
+            (pGpu->idInfo.PCISubDeviceID ==
+             CMP90_REJOIN9_PCI_SUBDEVICE_ID));
+}
+
+static NvBool
+_kgspCmp90Rejoin9ShouldEarlyHandoff
+(
+    OBJGPU *pGpu,
+    KernelGsp *pKernelGsp,
+    KernelGspFlcnUcode *pFlcnUcode
+)
+{
+    if (!_kgspCmp90Rejoin9IsExactTarget(pGpu))
+    {
+        return NV_FALSE;
+    }
+
+    if (pFlcnUcode != pKernelGsp->pBooterLoadUcode)
+    {
+        return NV_FALSE;
+    }
+
+    if (pKernelGsp->pSignatureMemdesc == NULL)
+    {
+        return NV_FALSE;
+    }
+
+    return (memdescGetSize(pKernelGsp->pSignatureMemdesc) ==
+            CMP90_REJOIN9_SIGNATURE_SIZE);
+}
 
 typedef struct {
     KernelFalcon *pKernelFlcn;
@@ -285,6 +336,71 @@ kgspExecuteHsFalcon_GA102
 
     // Start CPU now.
     kflcnStartCpu_HAL(pGpu, pKernelFlcn);
+
+    if (_kgspCmp90Rejoin9ShouldEarlyHandoff(pGpu, pKernelGsp, pFlcnUcode))
+    {
+        RMTIMEOUT timeout;
+        NvU32 pollCount = 0;
+        NvU32 featPlm = 0xffffffffU;
+        NvU32 wpr2LoRaw = 0xffffffffU;
+        NvU32 wpr2HiRaw = 0xffffffffU;
+        NvU32 falconCpuCtl = 0xffffffffU;
+        NvU32 irqStat = 0xffffffffU;
+        NvU32 mailbox0 = 0xffffffffU;
+        NvU32 mailbox1 = 0xffffffffU;
+        NV_STATUS pollStatus;
+
+        gpuSetTimeout(pGpu, CMP90_REJOIN9_EARLY_PLM_TIMEOUT_US,
+                      &timeout, 0);
+        for (;;)
+        {
+            featPlm = GPU_REG_RD32(pGpu, CMP90_REJOIN9_FEAT_OVR_PLM);
+            wpr2LoRaw = GPU_REG_RD32(pGpu, NV_PFB_PRI_MMU_WPR2_ADDR_LO);
+            wpr2HiRaw = GPU_REG_RD32(pGpu, NV_PFB_PRI_MMU_WPR2_ADDR_HI);
+            if (featPlm == CMP90_REJOIN9_PLM_OPEN)
+            {
+                falconCpuCtl = kflcnRegRead_HAL(
+                    pGpu, pKernelFlcn, NV_PFALCON_FALCON_CPUCTL);
+                irqStat = kflcnRegRead_HAL(
+                    pGpu, pKernelFlcn, NV_PFALCON_FALCON_IRQSTAT);
+                mailbox0 = kflcnRegRead_HAL(
+                    pGpu, pKernelFlcn, NV_PFALCON_FALCON_MAILBOX0);
+                mailbox1 = kflcnRegRead_HAL(
+                    pGpu, pKernelFlcn, NV_PFALCON_FALCON_MAILBOX1);
+                if (pMailbox0 != NULL)
+                    *pMailbox0 = mailbox0;
+                if (pMailbox1 != NULL)
+                    *pMailbox1 = mailbox1;
+                NV_PRINTF(
+                    LEVEL_ERROR,
+                    "CMP90_STOCKFLOW_REJOIN9: early PLM handoff "
+                    "poll_count=%u feat_plm=0x%08x "
+                    "wpr2_lo_raw=0x%08x wpr2_hi_raw=0x%08x "
+                    "falcon_cpu_ctl=0x%08x irq_stat=0x%08x "
+                    "mailbox0=0x%08x mailbox1=0x%08x; "
+                    "returning before Booter halt wait\n",
+                    pollCount, featPlm, wpr2LoRaw, wpr2HiRaw,
+                    falconCpuCtl, irqStat, mailbox0, mailbox1);
+                return NV_ERR_NOT_READY;
+            }
+
+            pollStatus = gpuCheckTimeout(pGpu, &timeout);
+            if (pollStatus == NV_ERR_TIMEOUT)
+            {
+                NV_PRINTF(
+                    LEVEL_ERROR,
+                    "CMP90_STOCKFLOW_REJOIN9: early PLM poll timed out "
+                    "poll_count=%u feat_plm=0x%08x "
+                    "wpr2_lo_raw=0x%08x wpr2_hi_raw=0x%08x; "
+                    "falling back to Booter halt wait\n",
+                    pollCount, featPlm, wpr2LoRaw, wpr2HiRaw);
+                break;
+            }
+            NV_CHECK_OK_OR_RETURN(LEVEL_ERROR, pollStatus);
+            pollCount++;
+            osDelay(1);
+        }
+    }
 
     // Wait for completion.
     status = kflcnWaitForHalt_HAL(pGpu, pKernelFlcn, GPU_TIMEOUT_DEFAULT, 0);
