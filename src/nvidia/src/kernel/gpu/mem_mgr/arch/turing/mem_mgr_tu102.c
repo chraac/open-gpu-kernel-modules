@@ -570,8 +570,19 @@ memmgrGetPteKindForScrubber_TU102
     NvU32          *pteKind
 )
 {
+    OBJGPU *pGpu;
+
     if (pteKind == NULL)
         return;
+
+    pGpu = ENG_GET_GPU(pMemoryManager);
+    if (pGpu != NULL &&
+        ((pGpu->idInfo.PCIDeviceID >> 16) == 0x20C2 ||
+         (pGpu->idInfo.PCIDeviceID >> 16) == 0x2082))
+    {
+        *pteKind = NV_MMU_PTE_KIND_GENERIC_MEMORY;
+        return;
+    }
 
     *pteKind = NV_MMU_PTE_KIND_GENERIC_MEMORY_COMPRESSIBLE_DISABLE_PLC;
 }
