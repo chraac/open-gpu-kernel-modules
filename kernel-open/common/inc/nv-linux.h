@@ -355,12 +355,12 @@ extern int nv_pat_mode;
 /* keep track of memory usage */
 #include "nv-memdbg.h"
 
-static inline void *nv_vmalloc(unsigned long size)
+static inline void *nv_vmalloc(unsigned long size, gfp_t flags)
 {
 #if defined(NV_VMALLOC_HAS_PGPROT_T_ARG)
-    void *ptr = __vmalloc(size, GFP_KERNEL, PAGE_KERNEL);
+    void *ptr = __vmalloc(size, flags, PAGE_KERNEL);
 #else
-    void *ptr = __vmalloc(size, GFP_KERNEL);
+    void *ptr = __vmalloc(size, flags);
 #endif
     NV_MEMDBG_ADD(ptr, size);
     return ptr;

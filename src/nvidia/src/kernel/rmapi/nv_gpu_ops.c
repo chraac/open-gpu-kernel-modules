@@ -9303,13 +9303,27 @@ NV_STATUS nvGpuOpsInitFaultInfo(struct gpuDevice *device,
     NvHandle  hDevice = device->handle;
     UvmFaultMetadataPacket *bufferMetadata = NULL;
 
-    status = serverGetClientUnderLock(&g_resServ, hClient, &pClient);
+    status = rmapiLockAcquire(RMAPI_LOCK_FLAGS_READ, RM_LOCK_MODULES_GPU_OPS);
     if (status != NV_OK)
         return status;
 
+    status = serverGetClientUnderLock(&g_resServ, hClient, &pClient);
+    if (status != NV_OK)
+    {
+        rmapiLockRelease();
+        return status;
+    }
+
     status = deviceGetByHandle(pClient, hDevice, &pDevice);
     if (status != NV_OK)
+    {
+        rmapiLockRelease();
         return status;
+    }
+
+    pGpu = GPU_RES_GET_GPU(pDevice);
+
+    rmapiLockRelease();
 
     pFaultInfo->pDevice = pDevice;
 
@@ -9323,8 +9337,6 @@ NV_STATUS nvGpuOpsInitFaultInfo(struct gpuDevice *device,
                            sizeof(faultBufferAllocParams));
     if (status != NV_OK)
         goto cleanup;
-
-    pGpu = GPU_RES_GET_GPU(pDevice);
 
     // When Hopper CC is enabled, UVM won't have direct access to the replayable
     // HW fault buffer. Instead, it will be using a shadow fault buffer in

@@ -36,25 +36,25 @@
 // and then checked back in. You cannot make changes to these sections without
 // corresponding changes to the buildmeister script
 #ifndef NV_BUILD_BRANCH
-    #define NV_BUILD_BRANCH             r597_06
+    #define NV_BUILD_BRANCH             r597_16
 #endif
 #ifndef NV_PUBLIC_BRANCH
-    #define NV_PUBLIC_BRANCH             r597_06
+    #define NV_PUBLIC_BRANCH             r597_16
 #endif
 
 #if defined(NV_LINUX) || defined(NV_BSD) || defined(NV_SUNOS)
-#define NV_BUILD_BRANCH_VERSION         "rel/gpu_drv/r595/r597_06-386"
-#define NV_BUILD_CHANGELIST_NUM         (38816880)
+#define NV_BUILD_BRANCH_VERSION         "rel/gpu_drv/r595/r597_16-417"
+#define NV_BUILD_CHANGELIST_NUM         (38976941)
 #define NV_BUILD_TYPE                   "Official"
-#define NV_BUILD_NAME                   "rel/gpu_drv/r595/r597_06-386"
-#define NV_LAST_OFFICIAL_CHANGELIST_NUM (38816880)
+#define NV_BUILD_NAME                   "rel/gpu_drv/r595/r597_16-417"
+#define NV_LAST_OFFICIAL_CHANGELIST_NUM (38976941)
 
 #else     /* Windows builds */
-#define NV_BUILD_BRANCH_VERSION         "r597_06-2"
-#define NV_BUILD_CHANGELIST_NUM         (38802797)
+#define NV_BUILD_BRANCH_VERSION         "r597_16-1"
+#define NV_BUILD_CHANGELIST_NUM         (38975756)
 #define NV_BUILD_TYPE                   "Official"
-#define NV_BUILD_NAME                   "597.09"
-#define NV_LAST_OFFICIAL_CHANGELIST_NUM (38802797)
+#define NV_BUILD_NAME                   "597.17"
+#define NV_LAST_OFFICIAL_CHANGELIST_NUM (38975756)
 #define NV_BUILD_BRANCH_BASE_VERSION    R595
 #endif
 // End buildmeister python edited section

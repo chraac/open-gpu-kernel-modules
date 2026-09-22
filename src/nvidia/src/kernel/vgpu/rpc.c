@@ -11616,6 +11616,7 @@ NV_STATUS rpcCtrlCmdNvlinkInbandSendData_v26_05
 
     rpc_params->dataSize = pParams->dataSize;
     portMemCopy(rpc_params->buffer, rpc_params->dataSize, pParams->buffer, pParams->dataSize);
+
     status = _issueRpcAndWait(pGpu, pRpc);
 
     return status;
