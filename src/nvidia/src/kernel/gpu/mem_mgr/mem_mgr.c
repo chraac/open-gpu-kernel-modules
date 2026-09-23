@@ -1171,6 +1171,35 @@ memmgrCreateHeap_IMPL
         }
 
         NV_ASSERT_OK_OR_RETURN(kmemsysPostHeapCreate_HAL(pGpu, pKernelMemorySystem));
+
+        {
+            NvU32 devId2 = pGpu->idInfo.PCIDeviceID >> 16;
+            if (devId2 == 0x20C2 || devId2 == 0x2082)
+            {
+                NvU32 ri;
+                NvU64 regionBytes = 0, publicBytes = 0;
+                for (ri = 0; ri < pMemoryManager->Ram.numFBRegions; ri++)
+                {
+                    NvU64 sz = pMemoryManager->Ram.fbRegion[ri].limit -
+                               pMemoryManager->Ram.fbRegion[ri].base + 1;
+                    regionBytes += sz;
+                    if (!pMemoryManager->Ram.fbRegion[ri].bRsvdRegion &&
+                        !pMemoryManager->Ram.fbRegion[ri].bInternalHeap)
+                        publicBytes += sz;
+                }
+                NV_PRINTF(LEVEL_ERROR,
+                          "SEC2_DEBUG_HEAP: fbAddrSpace=%lluMB mapRam=%lluMB "
+                          "fbTotal=%lluMB fbUsable=0x%llx heapTotal=0x%llx "
+                          "regionBytes=0x%llx publicBytes=0x%llx numRegions=%u\n",
+                          pMemoryManager->Ram.fbAddrSpaceSizeMb,
+                          pMemoryManager->Ram.mapRamSizeMb,
+                          pMemoryManager->Ram.fbTotalMemSizeMb,
+                          pMemoryManager->Ram.fbUsableMemSize,
+                          pMemoryManager->pHeap->total,
+                          regionBytes, publicBytes,
+                          pMemoryManager->Ram.numFBRegions);
+            }
+        }
     }
 
     return status;
@@ -3650,6 +3679,106 @@ _pmaInitFailed:
     return status;
 }
 
+NV_STATUS
+memmgrSec2DebugLateExtendHighPmaRegion
+(
+    OBJGPU        *pGpu,
+    MemoryManager *pMemoryManager
+)
+{
+    Heap *pHeap;
+    PMA *pPma;
+    PMA_REGION_DESCRIPTOR *pFirstPmaRegionDesc = NULL;
+    FB_REGION_DESCRIPTOR *pCandidate = NULL;
+    NvU32 numPmaRegions = 0;
+    NvU32 candidateIdx = MAX_FB_REGIONS;
+    NvU64 pmaFree = 0, pmaTotal = 0;
+    NvU64 heapFree = 0, heapTotal = 0;
+    NvU32 devId;
+    NvU64 stockFbBytes;
+    NvU32 i;
+    NV_STATUS status;
+
+    if (pGpu == NULL || pMemoryManager == NULL)
+        return NV_ERR_INVALID_ARGUMENT;
+
+    devId = pGpu->idInfo.PCIDeviceID >> 16;
+    if (devId != 0x20C2 && devId != 0x2082)
+        return NV_OK;
+
+    stockFbBytes = 0x200000000ULL;
+
+    pHeap = pMemoryManager->pHeap;
+    if (pHeap == NULL || pHeap->pPmaObject == NULL || !memmgrIsPmaInitialized(pMemoryManager))
+    {
+        NV_PRINTF(LEVEL_ERROR,
+                  "SEC2_DEBUG_LATE_PMA: no PMA, skipped heap=%p init=%u\n",
+                  pHeap,
+                  pHeap ? memmgrIsPmaInitialized(pMemoryManager) : 0);
+        return NV_OK;
+    }
+
+    pPma = pHeap->pPmaObject;
+    heapGetFree(pHeap, &heapFree);
+    heapGetSize(pHeap, &heapTotal);
+    pmaGetFreeMemory(pPma, &pmaFree);
+    pmaGetTotalMemory(pPma, &pmaTotal);
+
+    for (i = 0; i < pMemoryManager->Ram.numFBRegions; i++)
+    {
+        FB_REGION_DESCRIPTOR *pRegion = &pMemoryManager->Ram.fbRegion[i];
+        NV_PRINTF(LEVEL_ERROR,
+                  "SEC2_DEBUG_LATE_PMA: region[%u] base=0x%llx limit=0x%llx "
+                  "rsvd=%u rsvdSize=0x%llx intHeap=%u\n",
+                  i, pRegion->base, pRegion->limit,
+                  pRegion->bRsvdRegion, pRegion->rsvdSize, pRegion->bInternalHeap);
+    }
+
+    status = pmaGetRegionInfo(pPma, &numPmaRegions, &pFirstPmaRegionDesc);
+    if (status != NV_OK)
+    {
+        NV_PRINTF(LEVEL_ERROR,
+                  "SEC2_DEBUG_LATE_PMA: pmaGetRegionInfo failed 0x%x\n", status);
+        return status;
+    }
+
+    NV_PRINTF(LEVEL_ERROR,
+              "SEC2_DEBUG_LATE_PMA: numFBRegions=%u numPmaRegions=%u "
+              "stockFb=0x%llx pma_total=0x%llx pma_free=0x%llx "
+              "heap_total=0x%llx heap_free=0x%llx\n",
+              pMemoryManager->Ram.numFBRegions, numPmaRegions,
+              stockFbBytes, pmaTotal, pmaFree,
+              heapTotal, heapFree);
+
+    for (i = 0; i < pMemoryManager->Ram.numFBRegions; i++)
+    {
+        FB_REGION_DESCRIPTOR *pRegion = &pMemoryManager->Ram.fbRegion[i];
+        if (pRegion->bRsvdRegion && !pRegion->bInternalHeap &&
+            pRegion->limit >= stockFbBytes && pRegion->base <= pRegion->limit &&
+            (pCandidate == NULL || pRegion->limit > pCandidate->limit))
+        {
+            pCandidate = pRegion;
+            candidateIdx = i;
+        }
+    }
+
+    if (pCandidate == NULL)
+    {
+        NV_PRINTF(LEVEL_ERROR,
+                  "SEC2_DEBUG_LATE_PMA: no high reserved region found "
+                  "(looking for bRsvdRegion && limit>=0x%llx)\n",
+                  stockFbBytes);
+        return NV_OK;
+    }
+
+    NV_PRINTF(LEVEL_ERROR,
+              "SEC2_DEBUG_LATE_PMA: candidate=%u base=0x%llx limit=0x%llx left reserved "
+              "(backs WPR2)\n",
+              candidateIdx, pCandidate->base, pCandidate->limit);
+
+    return NV_OK;
+}
+
 
 /*!
  * @brief Retrieve the size of the client FB address space
@@ -4073,7 +4202,9 @@ memmgrInitCeUtils_IMPL
 
     if (!bFifoLite && !RMCFG_FEATURE_PLATFORM_GSP && bVirtualMode &&
         IS_SILICON(pGpu) && !pMemorySystemConfig->bDisableCompbitBacking &&
-        (pMemorySystemConfig->bUseRawModeComptaglineAllocation || pMemorySystemConfig->bOneToOneComptagLineAllocation))
+        (pMemorySystemConfig->bUseRawModeComptaglineAllocation || pMemorySystemConfig->bOneToOneComptagLineAllocation) &&
+        ((pGpu->idInfo.PCIDeviceID >> 16) != 0x20C2 &&
+         (pGpu->idInfo.PCIDeviceID >> 16) != 0x2082))
     {
         // Turn on virtual mode to enable compressed allocation access
         ceUtilsParams.flags |= DRF_DEF(0050_CEUTILS, _FLAGS, _VIRTUAL_MODE, _TRUE);
