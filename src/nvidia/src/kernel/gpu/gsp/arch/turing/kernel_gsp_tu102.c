@@ -59,6 +59,12 @@
 #include "g_all_dcl_pb.h"
 #include "lib/protobuf/prb.h"
 
+#define SEC2_DEBUG_PRI_FEATURE_OVERRIDE_PLM         0x00823804
+#define SEC2_DEBUG_PRI_FEATURE_OVERRIDE_SM_SPEED    0x0082381c
+#define SEC2_DEBUG_PRI_FEATURE_OVERRIDE_SM_SPEED_1  0x00823820
+#define SEC2_DEBUG_PRI_FBPA_CFG1                    0x009a0204
+#define SEC2_DEBUG_PRI_MMU_LMR                      0x00100ce0
+
 #include "events/gpu/ras/ras_events.h"
 #include "nvoc/event_bus.h"
 
@@ -415,18 +421,35 @@ kgspBootstrap_TU102
         // Execute FWSEC to setup FRTS if we have a FRTS region.
         if (kgspGetFrtsSize_HAL(pGpu, pKernelGsp) > 0)
         {
-            NV_ASSERT_OR_RETURN(pKernelGsp->pPreparedFwsecCmd != NULL, NV_ERR_INVALID_STATE);
+            NV_PRINTF(LEVEL_ERROR,
+                      "SEC2_DEBUG: FWSEC: pPreparedFwsecCmd=%p frtsSize=0x%x\n",
+                      pKernelGsp->pPreparedFwsecCmd,
+                      kgspGetFrtsSize_HAL(pGpu, pKernelGsp));
 
-            NV_ASSERT_OK_OR_RETURN(kflcnReset_HAL(pGpu, pKernelFalcon));
+            if (pKernelGsp->pPreparedFwsecCmd == NULL)
+            {
+                NV_PRINTF(LEVEL_ERROR, "SEC2_DEBUG: FWSEC cmd is NULL, aborting\n");
+                return NV_ERR_INVALID_STATE;
+            }
+
+            status = kflcnReset_HAL(pGpu, pKernelFalcon);
+            NV_PRINTF(LEVEL_ERROR,
+                      "SEC2_DEBUG: kflcnReset for FWSEC: 0x%x\n", status);
+            if (status != NV_OK) return status;
 
             status = kgspExecuteFwsec_HAL(pGpu, pKernelGsp, pKernelGsp->pPreparedFwsecCmd);
             portMemFree(pKernelGsp->pPreparedFwsecCmd);
             pKernelGsp->pPreparedFwsecCmd = NULL;
 
-            NV_ASSERT_OK_OR_RETURN(status);
+            NV_PRINTF(LEVEL_ERROR,
+                      "SEC2_DEBUG: FWSEC status=0x%x\n", status);
+            if (status != NV_OK) return status;
         }
 
-        NV_ASSERT_OK_OR_RETURN(kflcnResetIntoRiscv_HAL(pGpu, pKernelFalcon));
+        status = kflcnResetIntoRiscv_HAL(pGpu, pKernelFalcon);
+        NV_PRINTF(LEVEL_ERROR,
+                  "SEC2_DEBUG: kflcnResetIntoRiscv: 0x%x\n", status);
+        if (status != NV_OK) return status;
 
         // Load init args into mailbox regs
         kgspProgramLibosBootArgsAddr_HAL(pGpu, pKernelGsp);
@@ -435,6 +458,29 @@ kgspBootstrap_TU102
     // Execute Booter Load
     status = kgspExecuteBooterLoad_HAL(pGpu, pKernelGsp,
                                        _kgspGetBooterLoadArgs(pKernelGsp, bootMode));
+
+    {
+        NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
+        if (devId == 0x20C2 || devId == 0x2082)
+            NV_PRINTF(LEVEL_ERROR,
+                      "SEC2_DEBUG: normal BooterLoad status=0x%x\n", status);
+    }
+
+    {
+        NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
+        if ((devId == 0x20C2 || devId == 0x2082) && status == NV_OK)
+        {
+            NV_PRINTF(LEVEL_ERROR,
+                      "SEC2_DEBUG: POST-BooterLoad verify PLM=0x%08x SS0=0x%08x SS1=0x%08x "
+                      "CFG1=0x%08x LMR=0x%08x\n",
+                      GPU_REG_RD32(pGpu, SEC2_DEBUG_PRI_FEATURE_OVERRIDE_PLM),
+                      GPU_REG_RD32(pGpu, SEC2_DEBUG_PRI_FEATURE_OVERRIDE_SM_SPEED),
+                      GPU_REG_RD32(pGpu, SEC2_DEBUG_PRI_FEATURE_OVERRIDE_SM_SPEED_1),
+                      GPU_REG_RD32(pGpu, SEC2_DEBUG_PRI_FBPA_CFG1),
+                      GPU_REG_RD32(pGpu, SEC2_DEBUG_PRI_MMU_LMR));
+        }
+    }
+
     if (status != NV_OK)
     {
         NV_PRINTF(LEVEL_ERROR, "failed to execute Booter Load (ucode for initial boot): 0x%x\n", status);
