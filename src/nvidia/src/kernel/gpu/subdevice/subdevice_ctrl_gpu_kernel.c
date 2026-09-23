@@ -514,7 +514,15 @@ getGpuInfos(Subdevice *pSubdevice, NV2080_CTRL_GPU_GET_INFO_V2_PARAMS *pParams, 
             {
                 if (gpuGetIsCmpSku_HAL(pGpu))
                 {
-                    data = NV2080_CTRL_GPU_INFO_INDEX_CMP_SKU_YES;
+                    NvU32 cmpDevId = pGpu->idInfo.PCIDeviceID >> 16;
+                    if (cmpDevId == 0x20C2 || cmpDevId == 0x2082)
+                    {
+                        data = NV2080_CTRL_GPU_INFO_INDEX_CMP_SKU_NO;
+                    }
+                    else
+                    {
+                        data = NV2080_CTRL_GPU_INFO_INDEX_CMP_SKU_YES;
+                    }
                 }
                 else
                 {
