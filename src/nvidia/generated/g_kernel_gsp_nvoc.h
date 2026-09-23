@@ -572,6 +572,8 @@ struct KernelGsp {
     NvU8 *pGspRmBootUcodeImage;
     RM_RISCV_UCODE_DESC *pGspRmBootUcodeDesc;
     MEMORY_DESCRIPTOR *pGspUCodeRadix3Descriptor;
+    NvU8 *pStockSignatureData;
+    NvU64 stockSignatureSize;
     MEMORY_DESCRIPTOR *pSignatureMemdesc;
     NvU32 regTableSize;
     PACKED_REGISTRY_TABLE *pRegTable;
