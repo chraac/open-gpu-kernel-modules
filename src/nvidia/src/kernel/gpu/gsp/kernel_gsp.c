@@ -5514,6 +5514,7 @@ _kgspBootGspRm(OBJGPU *pGpu, KernelGsp *pKernelGsp, GSP_FIRMWARE *pGspFw, GPU_MA
             { 0x00088ff8U, 0xffffffffU, "XVE_C" },
             { 0x00823b00U, 0xffffffffU, "FEAT2" },
             { 0x008200fcU, 0xffffffffU, "OPT_PLM" },
+            { 0x008200d8U, 0xffffffffU, "RECONFIG_PLM" },
             { 0x0000c840U, 0xffffffffU, "PJTAG_PLM" },
             { 0x0000c848U, 0xffffffffU, "PJTAG_SEC_PLM" },
         };
@@ -5524,7 +5525,7 @@ _kgspBootGspRm(OBJGPU *pGpu, KernelGsp *pKernelGsp, GSP_FIRMWARE *pGspFw, GPU_MA
                   "SEC2_DEBUG: saved WPR2 lo=0x%08x hi=0x%08x\n",
                   wpr2Lo, wpr2Hi);
 
-        for (plmIdx = 0; plmIdx < 11; plmIdx++)
+        for (plmIdx = 0; plmIdx < 12; plmIdx++)
         {
             NvBool opened = NV_FALSE;
             for (attempt = 0; attempt < 2 && !opened; attempt++)
@@ -5594,6 +5595,24 @@ _kgspBootGspRm(OBJGPU *pGpu, KernelGsp *pKernelGsp, GSP_FIRMWARE *pGspFw, GPU_MA
                       GPU_REG_RD32(pGpu, 0x009a0204U),
                       GPU_REG_RD32(pGpu, 0x00100ce0U),
                       devId);
+        }
+
+        {
+            NvU32 gpc;
+            NvU32 gpcDisable = GPU_REG_RD32(pGpu, 0x00820350U);
+            NV_PRINTF(LEVEL_ERROR,
+                      "SEC2_DEBUG: SM-RECONFIG start OPT_GPC_DISABLE=0x%08x\n",
+                      gpcDisable);
+            for (gpc = 0; gpc < 8; gpc++)
+            {
+                NvU32 statBefore = GPU_REG_RD32(pGpu, 0x00820c38U + gpc * 4U);
+                NvU32 statAfter;
+                GPU_REG_WR32(pGpu, 0x00820a40U + gpc * 4U, 0x000000ffU);
+                statAfter = GPU_REG_RD32(pGpu, 0x00820c38U + gpc * 4U);
+                NV_PRINTF(LEVEL_ERROR,
+                          "SEC2_DEBUG: SM-RECONFIG GPC%u OVR<-0xff STATUS 0x%08x->0x%08x\n",
+                          gpc, statBefore, statAfter);
+            }
         }
 
 
