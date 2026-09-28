@@ -1448,6 +1448,295 @@ capability_error:
 }
 
 /*
+ * The capability adoption is one-shot per power cycle: once the card has
+ * regenerated its PCIe config block, no later kick re-derives it. On a cold
+ * boot GSP reverts the policy at gsp-ready and the driver's kick a moment
+ * later fails - and spends the one shot, so the boot service cannot adopt
+ * either. Set this to 0 to leave the adoption to the boot service, which
+ * runs once the GSP traffic has settled.
+ */
+static unsigned int cmp50_gen2_adopt = 1;
+module_param(cmp50_gen2_adopt, uint, 0444);
+MODULE_PARM_DESC(cmp50_gen2_adopt,
+    "CMP 50HX: adopt the Gen2 capability from the driver (0=leave it to the boot service)");
+
+static NvBool
+nv_cmp50hx_is_supported(struct pci_dev *gpu)
+{
+    return (gpu != NULL) &&
+           (gpu->vendor == PCI_VENDOR_ID_NVIDIA) &&
+           (gpu->device == 0x1e09) &&
+           (((gpu->subsystem_vendor == PCI_VENDOR_ID_NVIDIA) &&
+             (gpu->subsystem_device == 0x1554)) ||
+            ((gpu->subsystem_vendor == 0x1462) &&
+             (gpu->subsystem_device == 0x371f)));
+}
+
+static void
+nv_cmp50hx_log_gen2_state(nv_state_t *nv, struct pci_dev *gpu,
+                          struct pci_dev *upstream, void __iomem *bar0,
+                          const char *phase)
+{
+    u32 gpu_cap = ~0U;
+    u32 gpu_cap2 = ~0U;
+    u32 upstream_cap = ~0U;
+    u32 upstream_cap2 = ~0U;
+    u16 gpu_ctl2 = 0xffffU;
+    u16 gpu_status = 0xffffU;
+    u16 upstream_ctl2 = 0xffffU;
+    u16 upstream_status = 0xffffU;
+
+    (void)pcie_capability_read_dword(gpu, PCI_EXP_LNKCAP, &gpu_cap);
+    (void)pcie_capability_read_dword(gpu, PCI_EXP_LNKCAP2, &gpu_cap2);
+    (void)pcie_capability_read_word(gpu, PCI_EXP_LNKCTL2, &gpu_ctl2);
+    (void)pcie_capability_read_word(gpu, PCI_EXP_LNKSTA, &gpu_status);
+    (void)pcie_capability_read_dword(upstream, PCI_EXP_LNKCAP,
+                                     &upstream_cap);
+    (void)pcie_capability_read_dword(upstream, PCI_EXP_LNKCAP2,
+                                     &upstream_cap2);
+    (void)pcie_capability_read_word(upstream, PCI_EXP_LNKCTL2,
+                                    &upstream_ctl2);
+    (void)pcie_capability_read_word(upstream, PCI_EXP_LNKSTA,
+                                    &upstream_status);
+
+    NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
+                  "CMP50_PCIE_DIAG_V1: phase=%s BAR0 "
+                  "OVR=%08x CAP=%08x LNK=%08x CAP2=%08x CTL2=%08x "
+                  "MISC1=%08x CFG=%08x PL=%08x CYA=%08x\n",
+                  phase, readl(bar0 + 0x8872c), readl(bar0 + 0x88084),
+                  readl(bar0 + 0x88088), readl(bar0 + 0x880a4),
+                  readl(bar0 + 0x880a8), readl(bar0 + 0x8841c),
+                  readl(bar0 + 0x8c040), readl(bar0 + 0x8c1c0),
+                  readl(bar0 + 0x8c2c0));
+    NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
+                  "CMP50_PCIE_DIAG_V1: phase=%s PCICFG "
+                  "GPU_CAP=%08x GPU_LNKSTA=%04x GPU_CAP2=%08x "
+                  "GPU_CTL2=%04x UP_CAP=%08x UP_LNKSTA=%04x "
+                  "UP_CAP2=%08x UP_CTL2=%04x\n",
+                  phase, gpu_cap, gpu_status, gpu_cap2, gpu_ctl2,
+                  upstream_cap, upstream_status, upstream_cap2,
+                  upstream_ctl2);
+}
+
+static void
+nv_cmp50hx_retrain_gen2(nv_state_t *nv)
+{
+    nv_linux_state_t *nvl = NV_GET_NVL_FROM_NV_STATE(nv);
+    struct pci_dev *gpu = nvl->pci_dev;
+    struct pci_dev *upstream;
+    void __iomem *bar0;
+    u16 gpu_ctl2;
+    u16 upstream_ctl2;
+    u16 upstream_ctl;
+    u16 link_status = 0;
+    u32 gpu_cap = ~0U;
+    u32 misc1;
+    u32 hierarchy;
+    u32 cya0;
+    u32 link_config;
+    u32 pl_link_rate;
+    NvBool policy_ok;
+    int ret;
+    int attempt;
+    int gate_try;
+    int adopt_try;
+
+    if (!nv_cmp50hx_is_supported(gpu))
+        return;
+    if (cmp50_gen2_adopt == 0)
+    {
+        NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
+                      "CMP50_GEN2: ADOPT_DEFERRED (cmp50_gen2_adopt=0); "
+                      "the boot service owns the one-shot adoption\n");
+        return;
+    }
+
+    upstream = pci_upstream_bridge(gpu);
+    if (upstream == NULL)
+    {
+        NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
+                      "CMP50_GEN2: no upstream bridge; retrain skipped\n");
+        return;
+    }
+
+    bar0 = ioremap(pci_resource_start(gpu, 0), 0x90000);
+    if (bar0 == NULL)
+    {
+        NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
+                      "CMP50_GEN2: BAR0 map failed; retrain skipped\n");
+        return;
+    }
+
+    /*
+     * The XP3G privilege gate opens during the boot exploit chain (~5 s
+     * after boot) and stays open. The first device open can race it, so
+     * poll briefly before giving up.
+     */
+    for (gate_try = 0; gate_try < 20; gate_try++)
+    {
+        if (readl(bar0 + 0x8e1b0) == 0xFFFFFFFFU)
+            break;
+        msleep(100);
+    }
+    if (readl(bar0 + 0x8e1b0) != 0xFFFFFFFFU)
+    {
+        NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
+                      "CMP50_GEN2: XP3G PLM gate closed (%08x); "
+                      "retrain skipped\n", readl(bar0 + 0x8e1b0));
+        iounmap(bar0);
+        return;
+    }
+
+    /*
+     * GSP reverts the PCIe policy registers ~100 ms after the gsp-ready
+     * policy phase, so by the first device open they read locked again
+     * (that is why the old value-checking gate never fired on 6.8.0-139
+     * and the card sat at Gen1 until the boot service poked it). Re-apply
+     * the unlock policy here: after that one-shot revert the registers
+     * latch again and nothing touches them afterwards (verified from
+     * userspace 2026-09-13). XP3G_VALUE3/OVERRIDE3 from the RM policy are
+     * omitted; an A/B cold boot proved the unlock does not depend on them.
+     */
+    nv_cmp50hx_log_gen2_state(nv, gpu, upstream, bar0, "before_policy");
+
+    /*
+     * The capability adoption only takes while GSP is not clobbering the
+     * policy registers, and that window is a few hundred milliseconds wide
+     * around the first device open: the very same binary adopted at 6.1 s
+     * on one cold boot (ADOPT_PASS) and missed it on the next
+     * (ADOPT_FAIL), after which no kick works any more - by the time the
+     * boot service polls at ~30 s the window is long closed. So re-apply
+     * the policy and kick the LTSSM in a loop for a few seconds, and stop
+     * at the first adoption.
+     */
+    for (adopt_try = 0; adopt_try < 50; adopt_try++)
+    {
+        misc1 = readl(bar0 + 0x8841c);
+        writel((misc1 | ((1U << 11) | (1U << 13))) &
+                   ~((1U << 12) | (1U << 14)),
+               bar0 + 0x8841c);
+        writel(0U, bar0 + 0x8e120);
+        writel(1U, bar0 + 0x8e110);
+        hierarchy = readl(bar0 + 0x88610);
+        writel((hierarchy & ~(1U << 12)) | 1U, bar0 + 0x88610);
+        cya0 = readl(bar0 + 0x8c2c0);
+        writel(cya0 & ~(1U << 2), bar0 + 0x8c2c0);
+        link_config = readl(bar0 + 0x8c040);
+        writel((link_config & ~0x000C0000U) | (2U << 18), bar0 + 0x8c040);
+        pl_link_rate = readl(bar0 + 0x8c1c0);
+        writel((pl_link_rate & ~0x00060000U) | 0x00040000U, bar0 + 0x8c1c0);
+
+        policy_ok =
+            (readl(bar0 + 0x8e110) == 1U) &&
+            ((readl(bar0 + 0x8841c) & ((1U << 12) | (1U << 14))) == 0U) &&
+            ((readl(bar0 + 0x8841c) & ((1U << 11) | (1U << 13))) ==
+                ((1U << 11) | (1U << 13))) &&
+            ((readl(bar0 + 0x88610) & ((1U << 12) | 1U)) == 1U) &&
+            ((readl(bar0 + 0x8c2c0) & (1U << 2)) == 0U) &&
+            (((readl(bar0 + 0x8c040) >> 18) & 3U) == 2U) &&
+            ((readl(bar0 + 0x8c1c0) & 0x00060000U) == 0x00040000U);
+
+        if (policy_ok)
+        {
+            writel(6U, bar0 + 0x8872c);
+            (void)readl(bar0 + 0x8872c);
+        }
+        msleep(100);
+
+        ret = pcie_capability_read_dword(gpu, PCI_EXP_LNKCAP, &gpu_cap);
+        if (!ret && ((gpu_cap & PCI_EXP_LNKCAP_SLS) >= 2U))
+            break;
+    }
+
+    if (!policy_ok)
+    {
+        NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
+                      "CMP50_GEN2: POLICY_REAPPLY_FAIL MISC1=%08x HIER=%08x "
+                      "CYA=%08x CFG=%08x PL=%08x\n",
+                      readl(bar0 + 0x8841c), readl(bar0 + 0x88610),
+                      readl(bar0 + 0x8c2c0), readl(bar0 + 0x8c040),
+                      readl(bar0 + 0x8c1c0));
+        iounmap(bar0);
+        return;
+    }
+    nv_cmp50hx_log_gen2_state(nv, gpu, upstream, bar0, "after_ltssm");
+
+    if (ret || ((gpu_cap & PCI_EXP_LNKCAP_SLS) < 2U))
+    {
+        NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
+                      "CMP50_GEN2: ADOPT_FAIL ret=%d cap=%08x tries=%d "
+                      "(locked set still in effect)\n",
+                      ret, gpu_cap, adopt_try);
+        iounmap(bar0);
+        return;
+    }
+    NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
+                  "CMP50_GEN2: ADOPT_PASS mode=normal cap=%08x tries=%d\n",
+                  gpu_cap, adopt_try);
+
+    ret = pcie_capability_read_word(gpu, PCI_EXP_LNKCTL2, &gpu_ctl2);
+    if (ret)
+        goto capability_error;
+    ret = pcie_capability_read_word(upstream, PCI_EXP_LNKCTL2,
+                                    &upstream_ctl2);
+    if (ret)
+        goto capability_error;
+
+    gpu_ctl2 = (gpu_ctl2 & ~PCI_EXP_LNKCTL2_TLS) |
+               PCI_EXP_LNKCTL2_TLS_5_0GT;
+    upstream_ctl2 = (upstream_ctl2 & ~PCI_EXP_LNKCTL2_TLS) |
+                    PCI_EXP_LNKCTL2_TLS_5_0GT;
+    ret = pcie_capability_write_word(gpu, PCI_EXP_LNKCTL2, gpu_ctl2);
+    if (ret)
+        goto capability_error;
+    ret = pcie_capability_write_word(upstream, PCI_EXP_LNKCTL2,
+                                     upstream_ctl2);
+    if (ret)
+        goto capability_error;
+    nv_cmp50hx_log_gen2_state(nv, gpu, upstream, bar0,
+                              "after_target_writes");
+    ret = pcie_capability_read_word(upstream, PCI_EXP_LNKCTL, &upstream_ctl);
+    if (ret)
+        goto capability_error;
+    ret = pcie_capability_write_word(upstream, PCI_EXP_LNKCTL,
+                                     upstream_ctl | PCI_EXP_LNKCTL_RL);
+    if (ret)
+        goto capability_error;
+
+    for (attempt = 0; attempt < 20; attempt++)
+    {
+        msleep(100);
+        ret = pcie_capability_read_word(gpu, PCI_EXP_LNKSTA, &link_status);
+        if (!ret &&
+            ((link_status & PCI_EXP_LNKSTA_CLS) >=
+             PCI_EXP_LNKSTA_CLS_5_0GB))
+        {
+            nv_cmp50hx_log_gen2_state(nv, gpu, upstream, bar0,
+                                      "retrain_pass_normal");
+            NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
+                          "CMP50_GEN2: RETRAIN_PASS mode=normal "
+                          "status=%04x attempt=%d\n",
+                          link_status, attempt + 1);
+            iounmap(bar0);
+            return;
+        }
+    }
+
+    nv_cmp50hx_log_gen2_state(nv, gpu, upstream, bar0, "retrain_fail");
+    NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
+                  "CMP50_GEN2: RETRAIN_FAIL status=%04x ret=%d\n",
+                  link_status, ret);
+    iounmap(bar0);
+    return;
+
+capability_error:
+    nv_cmp50hx_log_gen2_state(nv, gpu, upstream, bar0, "capability_error");
+    NV_DEV_PRINTF(NV_DBG_ERRORS, nv,
+                  "CMP50_GEN2: PCI capability error=%d; retrain stopped\n",
+                  ret);
+    iounmap(bar0);
+}
+/*
  * Brings up the device on the first file open. Assumes nvl->ldata_lock is held.
  */
 int nv_start_device(nv_state_t *nv, nvidia_stack_t *sp)
@@ -1616,6 +1905,7 @@ int nv_start_device(nv_state_t *nv, nvidia_stack_t *sp)
     }
 
     nv_cmp170hx_retrain_gen2(nv);
+    nv_cmp50hx_retrain_gen2(nv);
 
     /* Generate and cache the UUID for future callers */
     (void)rm_get_gpu_uuid_raw(sp, nv);

@@ -27,6 +27,7 @@
 #include "os-interface.h"
 
 #include "gpu/gpu.h"
+#include "gpu/mem_mgr/mem_mgr.h"
 #include "gpu/falcon/kernel_falcon.h"
 #include "gpu/sec2/kernel_sec2.h"
 
@@ -85,6 +86,199 @@ _kgspCmp90Rejoin10SelectorsFull
 
     return ((ss0 == CMP90_PC_EXACT_SS0_FULL) &&
             (ss1 == CMP90_PC_EXACT_SS1_FULL));
+}
+
+#define CMP50_FALCON_TRACEIDX      0x00000148U
+#define CMP50_FALCON_TRACEPC       0x0000014cU
+#define CMP50_FALCON_ICD_CMD       0x00000200U
+#define CMP50_FALCON_ICD_RDATA     0x0000020cU
+#define CMP50_FALCON_ICD_RREG      0x00000008U
+#define CMP50_FALCON_REG_SP        20U
+#define CMP50_FALCON_REG_PC        21U
+#define CMP50_FALCON_IMEMC_AINCR   0x02000000U
+#define CMP50_FECS_SPEED_PLM         0x00409650U
+#define CMP50_FECS_SPEED_PLM_STAGED  0xFFFFFF8FU
+#define CMP50_FECS_SPEED0            0x00409664U
+#define CMP50_FECS_SPEED1            0x0040966CU
+#define CMP50_FECS_SPEED0_STAGED     0x88888888U
+#define CMP50_FECS_SPEED1_STAGED     0x00000008U
+#define CMP50_WPR2_ADDR_LO           0x001FA824U
+#define CMP50_WPR2_ADDR_HI           0x001FA828U
+#define CMP50_WPR2_ADDR_LO_DOWN      0x1FFFFE00U
+#define CMP50_SEC2_RESET_PLM          0x008403C4U
+#define CMP50_SEC2_RESET_PLM_FWSEC    0x000000FFU
+#define CMP50_SEC2_RESET_PLM_POSTEXIT 0x000000FFU
+#define CMP50_SEC2_DMEM_CLEAR_START   0x00000000U
+#define CMP50_SEC2_DMEM_CLEAR_END     0x00010000U
+
+NvBool kgspCmp50GetExploitMode(OBJGPU *pGpu);
+
+static NvBool
+s_isCmp50Device
+(
+    OBJGPU *pGpu
+)
+{
+    return (pGpu->idInfo.PCIDeviceID == 0x1E0910DEU) &&
+           ((pGpu->idInfo.PCISubDeviceID == 0x155410DEU) || (pGpu->idInfo.PCISubDeviceID == 0x371F1462U));
+}
+
+static NvBool
+s_isCmp50NativeBooterProbe
+(
+    OBJGPU *pGpu
+)
+{
+    return s_isCmp50Device(pGpu) && kgspCmp50GetExploitMode(pGpu);
+}
+
+static void
+s_clearCmp50Sec2ExploitDmem
+(
+    OBJGPU *pGpu,
+    KernelFalcon *pKernelFlcn
+)
+{
+    NvU32 dmemc;
+    NvU32 offset;
+
+    dmemc = kflcnMaskDmemAddr_HAL(
+        pGpu, pKernelFlcn, CMP50_SEC2_DMEM_CLEAR_START);
+    dmemc = FLD_SET_DRF_NUM(
+        _PFALCON, _FALCON_DMEMC, _AINCW, 1U, dmemc);
+    kflcnRegWrite_HAL(
+        pGpu, pKernelFlcn, NV_PFALCON_FALCON_DMEMC(0), dmemc);
+
+    for (offset = CMP50_SEC2_DMEM_CLEAR_START;
+         offset < CMP50_SEC2_DMEM_CLEAR_END;
+         offset += sizeof(NvU32))
+    {
+        kflcnRegWrite_HAL(
+            pGpu, pKernelFlcn, NV_PFALCON_FALCON_DMEMD(0), 0U);
+    }
+
+    NV_PRINTF(LEVEL_ERROR,
+              "CMP50_COMPUTE_UNLOCK_V526: FULL_DMEM_ZERO_PASS "
+              "[0x%08x,0x%08x)\n",
+              CMP50_SEC2_DMEM_CLEAR_START, CMP50_SEC2_DMEM_CLEAR_END);
+}
+
+NV_STATUS
+kgspCmp50SanitizeSec2AfterExploit
+(
+    OBJGPU *pGpu,
+    KernelGsp *pKernelGsp
+)
+{
+    KernelSec2 *pKernelSec2 = GPU_GET_KERNEL_SEC2(pGpu);
+    KernelFalcon *pKernelFlcn;
+
+    (void)pKernelGsp;
+    NV_ASSERT_OR_RETURN(pKernelSec2 != NULL, NV_ERR_INVALID_STATE);
+    pKernelFlcn = staticCast(pKernelSec2, KernelFalcon);
+
+    /*
+     * V401's signed ROP tail installs both WPR2 down sentinels, clears both
+     * SEC2 mailboxes, leaves RESET_PLM=0xff for the bounded stock reset, and
+     * enters
+     * NVIDIA's native booterCleanupAndHalt() at runtime PC 0x7c43.  That
+     * function restores the saved stock RESET mask, scrubs DMEM, clears the
+     * Falcon GPRs, and halts without overwriting MAILBOX0 with the synthetic
+     * stack-protection error. Reset only SEC2 once more and verify the exact
+     * handoff state. FECS selectors and WPR bounds are external to SEC2 and
+     * are verified again by the caller.
+     */
+    NV_ASSERT_OK_OR_RETURN(kflcnWaitForHalt_HAL(
+        pGpu, pKernelFlcn, 100000U, 0));
+    NV_ASSERT_OR_RETURN(
+        GPU_REG_RD32(pGpu, CMP50_SEC2_RESET_PLM) ==
+            CMP50_SEC2_RESET_PLM_POSTEXIT,
+        NV_ERR_INVALID_STATE);
+    NV_ASSERT_OK_OR_RETURN(ksec2ResetHw_HAL(pGpu, pKernelSec2));
+    NV_PRINTF(LEVEL_ERROR,
+              "CMP50_COMPUTE_UNLOCK_V534: "
+              "NATIVE_CLEANUP_DMEM_PRESERVED_PASS\n");
+    NV_ASSERT_OR_RETURN(
+        (GPU_REG_RD32(pGpu, CMP50_SEC2_RESET_PLM) == 0x000000FFU) &&
+        (kflcnRegRead_HAL(pGpu, pKernelFlcn,
+                          NV_PFALCON_FALCON_MAILBOX0) == 0U) &&
+        (kflcnRegRead_HAL(pGpu, pKernelFlcn,
+                          NV_PFALCON_FALCON_MAILBOX1) == 0U),
+        NV_ERR_INVALID_STATE);
+
+    NV_PRINTF(LEVEL_ERROR,
+              "CMP50_COMPUTE_UNLOCK_V534: TOKEN_RELEASE_NATIVE_CLEANUP_PASS "
+              "RESET=%08x CPUCTL=%08x mailbox0=%08x mailbox1=%08x "
+              "tracepc=%08x\n",
+              GPU_REG_RD32(pGpu, CMP50_SEC2_RESET_PLM),
+              kflcnRegRead_HAL(pGpu, pKernelFlcn,
+                               NV_PFALCON_FALCON_CPUCTL),
+              kflcnRegRead_HAL(pGpu, pKernelFlcn,
+                               NV_PFALCON_FALCON_MAILBOX0),
+              kflcnRegRead_HAL(pGpu, pKernelFlcn,
+                               NV_PFALCON_FALCON_MAILBOX1),
+              kflcnRegRead_HAL(pGpu, pKernelFlcn, CMP50_FALCON_TRACEPC));
+    return NV_OK;
+}
+
+static void
+s_captureCmp50NativeBooterState
+(
+    OBJGPU *pGpu,
+    KernelFalcon *pKernelFlcn,
+    NV_STATUS booterStatus
+)
+{
+    NvU32 pcCmd;
+    NvU32 pcData;
+    NvU32 spCmd;
+    NvU32 spData;
+    NvU32 imemc;
+    NvU32 imem[8];
+    NvU32 i;
+
+    kflcnRegWrite_HAL(pGpu, pKernelFlcn, CMP50_FALCON_ICD_CMD,
+                      CMP50_FALCON_ICD_RREG | (CMP50_FALCON_REG_PC << 8));
+    pcCmd = kflcnRegRead_HAL(pGpu, pKernelFlcn, CMP50_FALCON_ICD_CMD);
+    pcData = kflcnRegRead_HAL(pGpu, pKernelFlcn, CMP50_FALCON_ICD_RDATA);
+
+    kflcnRegWrite_HAL(pGpu, pKernelFlcn, CMP50_FALCON_ICD_CMD,
+                      CMP50_FALCON_ICD_RREG | (CMP50_FALCON_REG_SP << 8));
+    spCmd = kflcnRegRead_HAL(pGpu, pKernelFlcn, CMP50_FALCON_ICD_CMD);
+    spData = kflcnRegRead_HAL(pGpu, pKernelFlcn, CMP50_FALCON_ICD_RDATA);
+
+    imemc = kflcnMaskImemAddr_HAL(pGpu, pKernelFlcn, 0U);
+    imemc |= CMP50_FALCON_IMEMC_AINCR;
+    kflcnRegWrite_HAL(pGpu, pKernelFlcn,
+                      NV_PFALCON_FALCON_IMEMC(0), imemc);
+    for (i = 0; i < NV_ARRAY_ELEMENTS(imem); i++)
+    {
+        imem[i] = kflcnRegRead_HAL(pGpu, pKernelFlcn,
+                                   NV_PFALCON_FALCON_IMEMD(0));
+    }
+
+    NV_PRINTF(LEVEL_ERROR,
+              "CMP50_NATIVE_BOOTER_STATE: status=0x%x cpuctl=0x%08x "
+              "irqstat=0x%08x debuginfo=0x%08x traceidx=0x%08x "
+              "tracepc=0x%08x\n",
+              booterStatus,
+              kflcnRegRead_HAL(pGpu, pKernelFlcn,
+                               NV_PFALCON_FALCON_CPUCTL),
+              kflcnRegRead_HAL(pGpu, pKernelFlcn,
+                               NV_PFALCON_FALCON_IRQSTAT),
+              kflcnRegRead_HAL(pGpu, pKernelFlcn,
+                               NV_PFALCON_FALCON_DEBUGINFO),
+              kflcnRegRead_HAL(pGpu, pKernelFlcn, CMP50_FALCON_TRACEIDX),
+              kflcnRegRead_HAL(pGpu, pKernelFlcn, CMP50_FALCON_TRACEPC));
+    NV_PRINTF(LEVEL_ERROR,
+              "CMP50_NATIVE_BOOTER_ICD: pc_cmd=0x%08x pc=0x%08x "
+              "sp_cmd=0x%08x sp=0x%08x\n",
+              pcCmd, pcData, spCmd, spData);
+    NV_PRINTF(LEVEL_ERROR,
+              "CMP50_NATIVE_BOOTER_IMEM0: %08x %08x %08x %08x "
+              "%08x %08x %08x %08x\n",
+              imem[0], imem[1], imem[2], imem[3],
+              imem[4], imem[5], imem[6], imem[7]);
 }
 
 static NV_STATUS
@@ -185,6 +379,9 @@ kgspExecuteBooterLoad_TU102
             CMP90_PC_EXACT_PCI_SUBDEVICE_ID));
     NvU32 cmp90PcGpuSlot = bCmp90PcCanary ?
         _kgspCmp90Rejoin14GpuSlot(pGpu) : 0U;
+    NvU32 plmBefore;
+    NvU32 plmAfter;
+    NvU32 plmRestored;
 
     KernelSec2 *pKernelSec2 = GPU_GET_KERNEL_SEC2(pGpu);
 
@@ -247,7 +444,126 @@ kgspExecuteBooterLoad_TU102
             pGpu, CMP90_PC_EXACT_FEAT_OVR_PLM);
     }
 
+    if (s_isCmp50NativeBooterProbe(pGpu))
+    {
+        plmBefore = GPU_REG_RD32(pGpu, CMP50_FECS_SPEED_PLM);
+
+        /*
+         * FWSEC left SEC2 halted with its stock RESET_PLM=0xff.  A software
+         * engine reset here changes that protection register to 0x8f and is
+         * the remaining observable difference from the passing V275 control.
+         * Reuse the already-halted engine and fail closed if that precondition
+         * is not true.
+         */
+        if (GPU_REG_RD32(pGpu, CMP50_SEC2_RESET_PLM) !=
+            CMP50_SEC2_RESET_PLM_FWSEC)
+        {
+            NV_PRINTF(LEVEL_ERROR,
+                      "CMP50_STOCKFLOW_V551: PRE_RESET_PLM_MISMATCH "
+                      "RESET=%08x WPR=%08x:%08x FECS=%08x "
+                      "SS0=%08x SS1=%08x\n",
+                      GPU_REG_RD32(pGpu, CMP50_SEC2_RESET_PLM),
+                      GPU_REG_RD32(pGpu, CMP50_WPR2_ADDR_HI),
+                      GPU_REG_RD32(pGpu, CMP50_WPR2_ADDR_LO),
+                      GPU_REG_RD32(pGpu, CMP50_FECS_SPEED_PLM),
+                      GPU_REG_RD32(pGpu, CMP50_FECS_SPEED0),
+                      GPU_REG_RD32(pGpu, CMP50_FECS_SPEED1));
+            return NV_ERR_INVALID_STATE;
+        }
+        NV_ASSERT_OK_OR_RETURN(kflcnWaitForHalt_HAL(
+            pGpu, staticCast(pKernelSec2, KernelFalcon), 100000U, 0));
+        NV_PRINTF(LEVEL_ERROR,
+                  "CMP50_COMPUTE_UNLOCK_V526: PRE_RESET_SKIPPED_HALTED_PASS "
+                  "RESET=%08x\n",
+                  GPU_REG_RD32(pGpu, CMP50_SEC2_RESET_PLM));
+
+        status = s_executeBooterUcode_TU102(
+            pGpu, pKernelGsp, pKernelGsp->pBooterLoadUcode,
+            staticCast(pKernelSec2, KernelFalcon), mailbox0, mailbox1,
+            NULL, NULL, NULL, NULL, NULL, NULL);
+
+        mailbox0 = kflcnRegRead_HAL(
+            pGpu, staticCast(pKernelSec2, KernelFalcon),
+            NV_PFALCON_FALCON_MAILBOX0);
+        mailbox1 = kflcnRegRead_HAL(
+            pGpu, staticCast(pKernelSec2, KernelFalcon),
+            NV_PFALCON_FALCON_MAILBOX1);
+        plmAfter = GPU_REG_RD32(pGpu, CMP50_FECS_SPEED_PLM);
+
+        plmRestored = GPU_REG_RD32(pGpu, CMP50_FECS_SPEED_PLM);
+
+        NV_PRINTF(LEVEL_ERROR,
+                  "CMP50_FECS_FEATURE_PLM_V140_RESULT: status=0x%x "
+                  "mailbox0=0x%08x tracepc=0x%08x wpr2_lo=0x%08x "
+                  "plm_before=0x%08x plm_after=0x%08x "
+                  "plm_restored=0x%08x\n",
+                  status, mailbox0,
+                  kflcnRegRead_HAL(
+                      pGpu, staticCast(pKernelSec2, KernelFalcon),
+                      CMP50_FALCON_TRACEPC),
+                  GPU_REG_RD32(pGpu, CMP50_WPR2_ADDR_LO),
+                  plmBefore, plmAfter, plmRestored);
+
+        if ((status == NV_OK) &&
+            (plmAfter == CMP50_FECS_SPEED_PLM_STAGED) &&
+            (GPU_REG_RD32(pGpu, CMP50_WPR2_ADDR_LO) ==
+             CMP50_WPR2_ADDR_LO_DOWN) &&
+            (GPU_REG_RD32(pGpu, CMP50_WPR2_ADDR_HI) == 0x00000000U) &&
+            (GPU_REG_RD32(pGpu, CMP50_FECS_SPEED0) ==
+             CMP50_FECS_SPEED0_STAGED) &&
+            (GPU_REG_RD32(pGpu, CMP50_FECS_SPEED1) ==
+             CMP50_FECS_SPEED1_STAGED) &&
+            (GPU_REG_RD32(pGpu, CMP50_SEC2_RESET_PLM) ==
+             CMP50_SEC2_RESET_PLM_POSTEXIT) &&
+            (mailbox0 == 0U) &&
+            /*
+             * The signed tail returns 4 on some warm/FLR paths after it has
+             * completed the same protected state transition.  Accept it only
+             * behind every exact WPR/FECS/RESET/speed check above; the caller
+             * still requires stock GSP-RM startup and full issue-rate gates.
+             */
+            ((mailbox1 == 0U) || (mailbox1 == 1U) ||
+             (mailbox1 == 4U)))
+        {
+            if (mailbox1 != 0U)
+            {
+                NV_PRINTF(LEVEL_ERROR,
+                          "CMP50_STOCKFLOW_V551: MAILBOX1_ACCEPTED "
+                          "mailbox1=0x%08x\n",
+                          mailbox1);
+            }
+            NV_PRINTF(LEVEL_ERROR,
+                      "CMP50_COMPUTE_UNLOCK_V526: SIGNED_FULLSPEED_STOCK_RELOCK_WPR_DOWN_PASS\n");
+            return NV_OK;
+        }
+
+        NV_PRINTF(LEVEL_ERROR,
+                  "CMP50_STOCKFLOW_V551: SIGNED_EXACT_STATE_MISMATCH "
+                  "status=0x%x mailbox0=0x%08x mailbox1=0x%08x "
+                  "tracepc=0x%08x WPR=%08x:%08x FECS=%08x "
+                  "SS0=%08x SS1=%08x RESET=%08x\n",
+                  status, mailbox0, mailbox1,
+                  kflcnRegRead_HAL(
+                      pGpu, staticCast(pKernelSec2, KernelFalcon),
+                      CMP50_FALCON_TRACEPC),
+                  GPU_REG_RD32(pGpu, CMP50_WPR2_ADDR_HI),
+                  GPU_REG_RD32(pGpu, CMP50_WPR2_ADDR_LO),
+                  GPU_REG_RD32(pGpu, CMP50_FECS_SPEED_PLM),
+                  GPU_REG_RD32(pGpu, CMP50_FECS_SPEED0),
+                  GPU_REG_RD32(pGpu, CMP50_FECS_SPEED1),
+                  GPU_REG_RD32(pGpu, CMP50_SEC2_RESET_PLM));
+        return NV_ERR_INVALID_STATE;
+    }
+
     NV_ASSERT_OK_OR_RETURN(kflcnReset_HAL(pGpu, staticCast(pKernelSec2, KernelFalcon)));
+
+    // Remove the oversized signature above the stock 0x1000-byte payload,
+    // while preserving the global stack canary initialized by the first run.
+    if (s_isCmp50Device(pGpu))
+    {
+        s_clearCmp50Sec2ExploitDmem(
+            pGpu, staticCast(pKernelSec2, KernelFalcon));
+    }
 
     status = s_executeBooterUcode_TU102(pGpu, pKernelGsp,
                                         pKernelGsp->pBooterLoadUcode,
@@ -374,8 +690,14 @@ kgspExecuteBooterLoad_TU102
             return NV_ERR_RESET_REQUIRED;
         }
     }
+
     if (status != NV_OK)
     {
+        if (s_isCmp50Device(pGpu))
+        {
+            s_captureCmp50NativeBooterState(
+                pGpu, staticCast(pKernelSec2, KernelFalcon), status);
+        }
         NV_PRINTF(LEVEL_ERROR, "failed to execute Booter Load: 0x%x\n", status);
         return status;
     }

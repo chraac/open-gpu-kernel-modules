@@ -40,6 +40,279 @@
 #include "crashcat/crashcat_report.h"
 
 #include "published/turing/tu102/dev_gsp.h"
+
+#define CMP50_PC_CANARY_PCI_DEVICE_ID       0x1E0910DEU
+#define CMP50_PC_CANARY_PCI_SUBDEVICE_MATCHES(id) (((id) == 0x155410DEU) || ((id) == 0x371F1462U))
+#define CMP50_FECS_FEATURE_PLM               0x00409650U
+#define CMP50_FECS_FEATURE_PLM_POSTLOCK      0xFFFFFF8FU
+#define CMP50_FECS_SM_SPEED_OVERRIDE_0       0x00409664U
+#define CMP50_FECS_SM_SPEED_OVERRIDE_1       0x0040966CU
+#define CMP50_FECS_SM_SPEED_FULL_0           0x88888888U
+#define CMP50_FECS_SM_SPEED_FULL_1           0x00000008U
+#define CMP50_FECS_FEATURE_READOUT           0x00409660U
+#define CMP50_FECS_FEATURE_OVERRIDE_SM_SPEED_SELECT 0x00409664U
+#define CMP50_FECS_FEATURE_READOUT_SM_SPEED_SELECT  0x00409668U
+#define CMP50_FECS_FEATURE_OVERRIDE_SM_SPEED_SELECT_1 0x0040966CU
+#define CMP50_WPR2_STOCK_SPAN                0x00000E00U
+#define CMP50_WPR2_ADDR_LO_DOWN              0x1FFFFE00U
+#define CMP50_SEC2_RESET_PLM                  0x008403C4U
+#define CMP50_SEC2_RESET_PLM_STOCK            0x0000008FU
+#define CMP50_PCIE_LINK_CAP                  0x00088084U
+#define CMP50_PCIE_LINK_CAP2                 0x000880A4U
+#define CMP50_PCIE_LINK_CTRL2                0x000880A8U
+#define CMP50_PCIE_LINK_STATUS               0x00088088U
+#define CMP50_PCIE_VSEC_DEVICE               0x0008860CU
+#define CMP50_PCIE_VSEC_HIERARCHY            0x00088610U
+#define CMP50_PCIE_LTSSM                     0x0008872CU
+#define CMP50_PCIE_PRIV_MISC_1               0x0008841CU
+#define CMP50_PCIE_PRIV_MISC_1_GEN2_EN       ((1U << 11) | (1U << 13))
+#define CMP50_PCIE_PRIV_MISC_1_GEN2_VAL      ((1U << 12) | (1U << 14))
+#define CMP50_PCIE_LINK_CONFIG0              0x0008C040U
+#define CMP50_PCIE_PL_LINK_RATE              0x0008C1C0U
+#define CMP50_PCIE_CYA0                      0x0008C2C0U
+#define CMP50_PCIE_XP3G_STATUS0              0x0008E100U
+#define CMP50_PCIE_XP3G_OVERRIDE0            0x0008E110U
+#define CMP50_PCIE_XP3G_VALUE0               0x0008E120U
+#define CMP50_PCIE_XP3G_STATUS3              0x0008E10CU
+#define CMP50_PCIE_XP3G_OVERRIDE3            0x0008E11CU
+#define CMP50_PCIE_XP3G_VALUE3               0x0008E12CU
+#define CMP50_PCIE_XP3G_PLM0                 0x0008E1B0U
+#define CMP50_PCIE_PL_LINK_RATE_SPEED_MASK   0x00060000U
+#define CMP50_PCIE_PL_LINK_RATE_GEN2         0x00040000U
+
+void kgspCmp50SetExploitMode(OBJGPU *pGpu, NvBool bEnabled);
+NV_STATUS kgspCmp50RebuildStockSignature(OBJGPU *pGpu, KernelGsp *pKernelGsp);
+NV_STATUS kgspCmp50SanitizeSec2AfterExploit(OBJGPU *pGpu,
+                                            KernelGsp *pKernelGsp);
+NV_STATUS kgspCmp50ReplaceSignature(OBJGPU *pGpu, KernelGsp *pKernelGsp,
+                                    NvBool bSecondExploit);
+
+// Keep RM's automatic init retry from rebuilding FRTS/WPR after the bounded
+// V140 handoff transaction has committed. This is deliberately module-lifetime
+// only and keyed by stable PCI identity: RM can recycle gpuInstance values
+// across retry attempts in a multi-card module probe or boot.
+#define CMP50_STOCKFLOW_BDF_SLOTS 8192U
+static NvBool g_cmp50V274PhaseCommitted[CMP50_STOCKFLOW_BDF_SLOTS] = { NV_FALSE };
+static NvBool g_cmp50V274FwsecReady[CMP50_STOCKFLOW_BDF_SLOTS] = { NV_FALSE };
+static NvBool g_cmp50V274GspReady[CMP50_STOCKFLOW_BDF_SLOTS] = { NV_FALSE };
+static NvU32 g_cmp50StockWprLo[CMP50_STOCKFLOW_BDF_SLOTS] = { 0U };
+static NvU32 g_cmp50StockWprHi[CMP50_STOCKFLOW_BDF_SLOTS] = { 0U };
+
+static NvBool
+s_isCmp50ComputeUnlock
+(
+    OBJGPU *pGpu
+)
+{
+    return (pGpu->idInfo.PCIDeviceID == CMP50_PC_CANARY_PCI_DEVICE_ID) &&
+           CMP50_PC_CANARY_PCI_SUBDEVICE_MATCHES(pGpu->idInfo.PCISubDeviceID);
+}
+
+static void
+s_cmp50ApplyGen2Policy
+(
+    OBJGPU *pGpu,
+    const char *phase
+)
+{
+    NvU32 xp3gPlm = GPU_REG_RD32(pGpu, CMP50_PCIE_XP3G_PLM0);
+    NvU32 vsecDevice = GPU_REG_RD32(pGpu, CMP50_PCIE_VSEC_DEVICE);
+    NvU32 privMisc = GPU_REG_RD32(pGpu, CMP50_PCIE_PRIV_MISC_1);
+    NvU32 privMiscWant =
+        (privMisc | CMP50_PCIE_PRIV_MISC_1_GEN2_EN) &
+        ~CMP50_PCIE_PRIV_MISC_1_GEN2_VAL;
+    NvU32 origOvr0;
+    NvU32 origVal0;
+    NvU32 origOvr3;
+    NvU32 origVal3;
+    NvU32 origHierarchy;
+    NvU32 origCya0;
+    NvU32 origLinkConfig0;
+    NvU32 origPlLinkRate;
+    NvU32 origLtssm;
+    NvBool policyOk;
+
+    if (xp3gPlm != 0xFFFFFFFFU)
+    {
+        NV_PRINTF(LEVEL_ERROR,
+                  "CMP50_GEN2: PROTECTED_GATE_FAIL phase=%s "
+                  "XP3G_PLM=%08x VSEC=%08x PRIV_MISC=%08x\n",
+                  phase, xp3gPlm, vsecDevice, privMisc);
+        return;
+    }
+
+    origOvr0 = GPU_REG_RD32(pGpu, CMP50_PCIE_XP3G_OVERRIDE0);
+    origVal0 = GPU_REG_RD32(pGpu, CMP50_PCIE_XP3G_VALUE0);
+    origOvr3 = GPU_REG_RD32(pGpu, CMP50_PCIE_XP3G_OVERRIDE3);
+    origVal3 = GPU_REG_RD32(pGpu, CMP50_PCIE_XP3G_VALUE3);
+    origHierarchy = GPU_REG_RD32(pGpu, CMP50_PCIE_VSEC_HIERARCHY);
+    origCya0 = GPU_REG_RD32(pGpu, CMP50_PCIE_CYA0);
+    origLinkConfig0 = GPU_REG_RD32(pGpu, CMP50_PCIE_LINK_CONFIG0);
+    origPlLinkRate = GPU_REG_RD32(pGpu, CMP50_PCIE_PL_LINK_RATE);
+    origLtssm = GPU_REG_RD32(pGpu, CMP50_PCIE_LTSSM);
+
+    /*
+     * The capability adoption is one-shot: the LTSSM=6 kick below makes the
+     * card regenerate its PCIe config block from whatever the policy regs
+     * hold at that instant. This function runs twice (post-booter and
+     * gsp-ready). On a cold boot the post-booter pass adopts Gen2, then GSP
+     * starts clobbering the policy regs, and a second kick at gsp-ready
+     * re-derives the now-locked set and destroys the Gen2 we just won
+     * (192.168.1.224, 2026-09-17: post-booter CAP=453d02 -> gsp-ready
+     * CAP=453d01). Boots that came up already Gen2 never hit this because
+     * GSP does not fight an already-unlocked block. So once the capability
+     * reads Gen2, do not touch the policy again - only keep the target link
+     * speed latched and return.
+     */
+    if ((GPU_REG_RD32(pGpu, CMP50_PCIE_LINK_CAP) & 0xFU) >= 2U)
+    {
+        NvU32 linkCtrl2 = GPU_REG_RD32(pGpu, CMP50_PCIE_LINK_CTRL2);
+
+        if ((linkCtrl2 & 0xFU) != 2U)
+            GPU_REG_WR32(pGpu, CMP50_PCIE_LINK_CTRL2,
+                         (linkCtrl2 & ~0xFU) | 2U);
+        NV_PRINTF(LEVEL_ERROR,
+                  "CMP50_GEN2: ALREADY_GEN2 phase=%s CAP=%08x LC2=%08x "
+                  "(not re-kicking)\n",
+                  phase, GPU_REG_RD32(pGpu, CMP50_PCIE_LINK_CAP),
+                  GPU_REG_RD32(pGpu, CMP50_PCIE_LINK_CTRL2));
+        return;
+    }
+
+    GPU_REG_WR32(pGpu, CMP50_PCIE_PRIV_MISC_1, privMiscWant);
+    GPU_REG_WR32(pGpu, CMP50_PCIE_XP3G_VALUE0, 0U);
+    GPU_REG_WR32(pGpu, CMP50_PCIE_XP3G_OVERRIDE0, 1U);
+    GPU_REG_WR32(pGpu, CMP50_PCIE_XP3G_VALUE3, 0x00200000U);
+    GPU_REG_WR32(pGpu, CMP50_PCIE_XP3G_OVERRIDE3, 4U);
+    GPU_REG_WR32(pGpu, CMP50_PCIE_VSEC_HIERARCHY,
+                 (origHierarchy & ~(1U << 12)) | 1U);
+    GPU_REG_WR32(pGpu, CMP50_PCIE_CYA0, origCya0 & ~(1U << 2));
+    GPU_REG_WR32(pGpu, CMP50_PCIE_LINK_CONFIG0,
+                 (origLinkConfig0 & ~0x000C0000U) | (2U << 18));
+    GPU_REG_WR32(pGpu, CMP50_PCIE_PL_LINK_RATE,
+                 (origPlLinkRate & ~CMP50_PCIE_PL_LINK_RATE_SPEED_MASK) |
+                     CMP50_PCIE_PL_LINK_RATE_GEN2);
+    GPU_REG_WR32(pGpu, CMP50_PCIE_LTSSM, 6U);
+
+    policyOk =
+        (GPU_REG_RD32(pGpu, CMP50_PCIE_XP3G_VALUE0) == 0U) &&
+        (GPU_REG_RD32(pGpu, CMP50_PCIE_XP3G_OVERRIDE0) == 1U) &&
+        (GPU_REG_RD32(pGpu, CMP50_PCIE_XP3G_VALUE3) == 0x00200000U) &&
+        (GPU_REG_RD32(pGpu, CMP50_PCIE_XP3G_OVERRIDE3) == 4U) &&
+        ((GPU_REG_RD32(pGpu, CMP50_PCIE_PRIV_MISC_1) &
+          CMP50_PCIE_PRIV_MISC_1_GEN2_EN) ==
+            CMP50_PCIE_PRIV_MISC_1_GEN2_EN) &&
+        ((GPU_REG_RD32(pGpu, CMP50_PCIE_PRIV_MISC_1) &
+          CMP50_PCIE_PRIV_MISC_1_GEN2_VAL) == 0U) &&
+        ((GPU_REG_RD32(pGpu, CMP50_PCIE_VSEC_HIERARCHY) &
+          ((1U << 12) | 1U)) == 1U) &&
+        ((GPU_REG_RD32(pGpu, CMP50_PCIE_CYA0) & (1U << 2)) == 0U) &&
+        (((GPU_REG_RD32(pGpu, CMP50_PCIE_LINK_CONFIG0) >> 18) & 3U) == 2U) &&
+        ((GPU_REG_RD32(pGpu, CMP50_PCIE_PL_LINK_RATE) &
+            CMP50_PCIE_PL_LINK_RATE_SPEED_MASK) ==
+            CMP50_PCIE_PL_LINK_RATE_GEN2) &&
+        (GPU_REG_RD32(pGpu, CMP50_PCIE_LTSSM) == 6U);
+
+    if (!policyOk)
+    {
+        NV_PRINTF(LEVEL_ERROR,
+                  "CMP50_GEN2: POLICY_MISMATCH phase=%s "
+                  "OVR=%08x/%08x VAL=%08x/%08x HIER=%08x "
+                  "PRIV=%08x LC2=%08x CYA=%08x CFG=%08x PL=%08x "
+                  "LTSSM=%08x\n",
+                  phase,
+                  GPU_REG_RD32(pGpu, CMP50_PCIE_XP3G_OVERRIDE0),
+                  GPU_REG_RD32(pGpu, CMP50_PCIE_XP3G_OVERRIDE3),
+                  GPU_REG_RD32(pGpu, CMP50_PCIE_XP3G_VALUE0),
+                  GPU_REG_RD32(pGpu, CMP50_PCIE_XP3G_VALUE3),
+                  GPU_REG_RD32(pGpu, CMP50_PCIE_VSEC_HIERARCHY),
+                  GPU_REG_RD32(pGpu, CMP50_PCIE_PRIV_MISC_1),
+                  GPU_REG_RD32(pGpu, CMP50_PCIE_LINK_CTRL2),
+                  GPU_REG_RD32(pGpu, CMP50_PCIE_CYA0),
+                  GPU_REG_RD32(pGpu, CMP50_PCIE_LINK_CONFIG0),
+                  GPU_REG_RD32(pGpu, CMP50_PCIE_PL_LINK_RATE),
+                  GPU_REG_RD32(pGpu, CMP50_PCIE_LTSSM));
+        GPU_REG_WR32(pGpu, CMP50_PCIE_XP3G_OVERRIDE0, origOvr0);
+        GPU_REG_WR32(pGpu, CMP50_PCIE_XP3G_VALUE0, origVal0);
+        GPU_REG_WR32(pGpu, CMP50_PCIE_XP3G_OVERRIDE3, origOvr3);
+        GPU_REG_WR32(pGpu, CMP50_PCIE_XP3G_VALUE3, origVal3);
+        GPU_REG_WR32(pGpu, CMP50_PCIE_PRIV_MISC_1, privMisc);
+        GPU_REG_WR32(pGpu, CMP50_PCIE_VSEC_HIERARCHY, origHierarchy);
+        GPU_REG_WR32(pGpu, CMP50_PCIE_CYA0, origCya0);
+        GPU_REG_WR32(pGpu, CMP50_PCIE_LINK_CONFIG0, origLinkConfig0);
+        GPU_REG_WR32(pGpu, CMP50_PCIE_PL_LINK_RATE, origPlLinkRate);
+        GPU_REG_WR32(pGpu, CMP50_PCIE_LTSSM, origLtssm);
+        NV_PRINTF(LEVEL_ERROR,
+                  "CMP50_GEN2: POLICY_ROLLBACK phase=%s "
+                  "OVR=%08x/%08x VAL=%08x/%08x LC2=%08x "
+                  "CFG=%08x PL=%08x LTSSM=%08x\n",
+                  phase,
+                  GPU_REG_RD32(pGpu, CMP50_PCIE_XP3G_OVERRIDE0),
+                  GPU_REG_RD32(pGpu, CMP50_PCIE_XP3G_OVERRIDE3),
+                  GPU_REG_RD32(pGpu, CMP50_PCIE_XP3G_VALUE0),
+                  GPU_REG_RD32(pGpu, CMP50_PCIE_XP3G_VALUE3),
+                  GPU_REG_RD32(pGpu, CMP50_PCIE_LINK_CTRL2),
+                  GPU_REG_RD32(pGpu, CMP50_PCIE_LINK_CONFIG0),
+                  GPU_REG_RD32(pGpu, CMP50_PCIE_PL_LINK_RATE),
+                  GPU_REG_RD32(pGpu, CMP50_PCIE_LTSSM));
+        return;
+    }
+
+    /*
+     * Latch the Gen2 target link speed while the card still advertises the
+     * unlocked capability: this is the only window where the write is not
+     * dropped (with CAP=0x453d01 both the config register and this BAR0
+     * mirror silently ignore it). Boots that came up with LC2 already at 2 -
+     * inherited through standby power from a boot that had reached Gen2 -
+     * kept CAP=0x453d02 through gsp-ready and adopted; boots that came up
+     * cold with LC2=1 had the capability reverted by GSP and never adopted
+     * again (journal of 192.168.1.224, boots of 2026-09-13/14 vs
+     * 2026-09-17). Seeding it here is what restarts that chain.
+     */
+    if ((GPU_REG_RD32(pGpu, CMP50_PCIE_LINK_CAP) & 0xFU) >= 2U)
+    {
+        NvU32 linkCtrl2 = GPU_REG_RD32(pGpu, CMP50_PCIE_LINK_CTRL2);
+
+        if ((linkCtrl2 & 0xFU) != 2U)
+        {
+            GPU_REG_WR32(pGpu, CMP50_PCIE_LINK_CTRL2,
+                         (linkCtrl2 & ~0xFU) | 2U);
+        }
+    }
+
+    NV_PRINTF(LEVEL_ERROR,
+              "CMP50_GEN2: POLICY_PASS phase=%s CAP=%08x CAP2=%08x "
+              "STAT=%08x XP3G=%08x/%08x/%08x/%08x "
+              "VSEC=%08x/%08x PRIV=%08x LC2=%08x CFG=%08x PL=%08x\n",
+              phase,
+              GPU_REG_RD32(pGpu, CMP50_PCIE_LINK_CAP),
+              GPU_REG_RD32(pGpu, CMP50_PCIE_LINK_CAP2),
+              GPU_REG_RD32(pGpu, CMP50_PCIE_LINK_STATUS),
+              GPU_REG_RD32(pGpu, CMP50_PCIE_XP3G_STATUS0),
+              GPU_REG_RD32(pGpu, CMP50_PCIE_XP3G_OVERRIDE0),
+              GPU_REG_RD32(pGpu, CMP50_PCIE_XP3G_STATUS3),
+              GPU_REG_RD32(pGpu, CMP50_PCIE_XP3G_OVERRIDE3),
+              GPU_REG_RD32(pGpu, CMP50_PCIE_VSEC_DEVICE),
+              GPU_REG_RD32(pGpu, CMP50_PCIE_VSEC_HIERARCHY),
+              GPU_REG_RD32(pGpu, CMP50_PCIE_PRIV_MISC_1),
+              GPU_REG_RD32(pGpu, CMP50_PCIE_LINK_CTRL2),
+              GPU_REG_RD32(pGpu, CMP50_PCIE_LINK_CONFIG0),
+              GPU_REG_RD32(pGpu, CMP50_PCIE_PL_LINK_RATE));
+}
+
+static NvU32
+s_cmp50StockflowGpuIndex
+(
+    OBJGPU *pGpu
+)
+{
+    NvU32 slot = ((NvU32)gpuGetBus(pGpu) * 32U) +
+                 (NvU32)gpuGetDevice(pGpu);
+
+    if (slot < CMP50_STOCKFLOW_BDF_SLOTS)
+        return slot;
+    return pGpu->gpuInstance % CMP50_STOCKFLOW_BDF_SLOTS;
+}
 #include "published/turing/tu102/dev_gsp_addendum.h"
 #include "published/turing/tu102/dev_riscv_pri.h"
 #include "published/turing/tu102/dev_fbif_v4.h"
@@ -312,6 +585,12 @@ kgspFreeBootArgs_TU102
         memdescDestroy(pKernelGsp->pSignatureMemdesc);
         pKernelGsp->pSignatureMemdesc = NULL;
     }
+    if (pKernelGsp->pStockSignatureData != NULL)
+    {
+        portMemFree(pKernelGsp->pStockSignatureData);
+        pKernelGsp->pStockSignatureData = NULL;
+        pKernelGsp->stockSignatureSize = 0;
+    }
 
     // Release sysmem heap memory
     if (pKernelGsp->pSysmemHeapDescriptor != NULL)
@@ -502,6 +781,86 @@ _kgspGetBooterLoadArgs
     return 0;
 }
 
+/*
+ * SEC2 can retain the first WPR-metadata DMA page across consecutive Booter
+ * launches.  Merely moving the signature therefore does not make the second
+ * launch consume the updated signature address.  Give every CMP50 launch a
+ * distinct physical metadata page, then copy Booter's mutations back to the
+ * canonical RM metadata before releasing the temporary page.
+ */
+static NV_STATUS
+_kgspCmp50ExecuteBooterFreshMeta
+(
+    OBJGPU *pGpu,
+    KernelGsp *pKernelGsp
+)
+{
+    NV_STATUS status = NV_OK;
+    NV_STATUS bootStatus = NV_OK;
+    MEMORY_DESCRIPTOR *pFreshMeta = NULL;
+    NvU8 *pFreshVa = NULL;
+    NvU64 freshPhys;
+    NvU64 flags = MEMDESC_FLAGS_ALLOC_IN_UNPROTECTED_MEMORY;
+
+    if ((pKernelGsp->pWprMeta == NULL) ||
+        (pKernelGsp->pWprMetaDescriptor == NULL))
+    {
+        return NV_ERR_INVALID_STATE;
+    }
+
+    NV_CHECK_OK_OR_GOTO(status, LEVEL_ERROR,
+        memdescCreate(&pFreshMeta, pGpu, 0x1000, 0x1000,
+            NV_TRUE, ADDR_SYSMEM, NV_MEMORY_CACHED, flags), cleanup);
+    memdescTagAlloc(status, NV_FB_ALLOC_RM_INTERNAL_OWNER_WPR_METADATA,
+                    pFreshMeta);
+    NV_CHECK_OK_OR_GOTO(status, LEVEL_ERROR, status, cleanup);
+
+    pFreshVa = memdescMapInternal(pGpu, pFreshMeta, TRANSFER_FLAGS_NONE);
+    NV_CHECK_OK_OR_GOTO(status, LEVEL_ERROR,
+        (pFreshVa != NULL) ? NV_OK : NV_ERR_INSUFFICIENT_RESOURCES,
+        cleanup);
+    portMemSet(pFreshVa, 0, 0x1000);
+    portMemCopy(pFreshVa, 0x1000, pKernelGsp->pWprMeta,
+                sizeof(*pKernelGsp->pWprMeta));
+    memdescUnmapInternal(pGpu, pFreshMeta, 0);
+    pFreshVa = NULL;
+    memdescFlushCpuCaches(pGpu, pFreshMeta);
+
+    freshPhys = memdescGetPhysAddr(pFreshMeta, AT_GPU, 0);
+    NV_PRINTF(LEVEL_ERROR,
+              "CMP50_COMPUTE_UNLOCK_V140: fresh WPR metadata "
+              "phys=0x%llx signature=0x%llx size=0x%llx\n",
+              freshPhys,
+              pKernelGsp->pWprMeta->sysmemAddrOfSignature,
+              pKernelGsp->pWprMeta->sizeOfSignature);
+
+    bootStatus = kgspExecuteBooterLoad_HAL(pGpu, pKernelGsp, freshPhys);
+
+    pFreshVa = memdescMapInternal(pGpu, pFreshMeta, TRANSFER_FLAGS_NONE);
+    NV_CHECK_OK_OR_GOTO(status, LEVEL_ERROR,
+        (pFreshVa != NULL) ? NV_OK : NV_ERR_INSUFFICIENT_RESOURCES,
+        cleanup);
+    portMemCopy(pKernelGsp->pWprMeta,
+                sizeof(*pKernelGsp->pWprMeta),
+                pFreshVa, sizeof(*pKernelGsp->pWprMeta));
+    memdescUnmapInternal(pGpu, pFreshMeta, 0);
+    pFreshVa = NULL;
+    memdescFlushCpuCaches(pGpu, pKernelGsp->pWprMetaDescriptor);
+    status = bootStatus;
+
+cleanup:
+    if (pFreshVa != NULL)
+    {
+        memdescUnmapInternal(pGpu, pFreshMeta, 0);
+    }
+    if (pFreshMeta != NULL)
+    {
+        memdescFree(pFreshMeta);
+        memdescDestroy(pFreshMeta);
+    }
+    return status;
+}
+
 /*!
  * Boot GSP-RM.
  *
@@ -534,6 +893,408 @@ kgspBootstrap_TU102
 {
     NV_STATUS status;
     KernelFalcon *pKernelFalcon = staticCast(pKernelGsp, KernelFalcon);
+    NvU32 cmp50StateIndex = s_cmp50StockflowGpuIndex(pGpu);
+    NvBool bCmp50RetryRejoin = NV_FALSE;
+
+    if ((bootMode == KGSP_BOOT_MODE_NORMAL) &&
+        s_isCmp50ComputeUnlock(pGpu) &&
+        g_cmp50V274PhaseCommitted[cmp50StateIndex])
+    {
+        NvU32 retryWprLo =
+            GPU_REG_RD32(pGpu, NV_PFB_PRI_MMU_WPR2_ADDR_LO);
+        NvU32 retryWprHi =
+            GPU_REG_RD32(pGpu, NV_PFB_PRI_MMU_WPR2_ADDR_HI);
+        NvBool bRetryWprDown =
+            (retryWprHi == 0U) &&
+            (retryWprLo == CMP50_WPR2_ADDR_LO_DOWN);
+        NvBool bRetryWprRange =
+            (retryWprLo != 0U) && (retryWprLo < retryWprHi);
+
+        if (!(bRetryWprDown || bRetryWprRange) ||
+            (GPU_REG_RD32(pGpu, CMP50_FECS_FEATURE_PLM) !=
+             CMP50_FECS_FEATURE_PLM_POSTLOCK) ||
+            (GPU_REG_RD32(pGpu, CMP50_FECS_SM_SPEED_OVERRIDE_0) !=
+             CMP50_FECS_SM_SPEED_FULL_0) ||
+            (GPU_REG_RD32(pGpu, CMP50_FECS_SM_SPEED_OVERRIDE_1) !=
+             CMP50_FECS_SM_SPEED_FULL_1))
+        {
+            NV_PRINTF(LEVEL_ERROR,
+                      "CMP50_STOCKFLOW_V551: "
+                      "RETRY_REJOIN_STATE_MISMATCH idx=%u "
+                      "WPR=%08x:%08x FECS=%08x SS0=%08x SS1=%08x\n",
+                      cmp50StateIndex, retryWprHi, retryWprLo,
+                      GPU_REG_RD32(pGpu, CMP50_FECS_FEATURE_PLM),
+                      GPU_REG_RD32(pGpu,
+                          CMP50_FECS_SM_SPEED_OVERRIDE_0),
+                      GPU_REG_RD32(pGpu,
+                          CMP50_FECS_SM_SPEED_OVERRIDE_1));
+            return NV_ERR_INVALID_STATE;
+        }
+
+        if (g_cmp50V274GspReady[cmp50StateIndex])
+        {
+            NvU32 plm;
+            NvU32 speed0;
+            NvU32 speed1;
+
+            if (pKernelGsp->pPreparedFwsecCmd == NULL)
+            {
+                NV_PRINTF(LEVEL_ERROR,
+                          "CMP50_STOCKFLOW_V551: "
+                          "PERSISTENT_READY_NO_FWSEC idx=%u "
+                          "WPR=%08x:%08x\n",
+                          cmp50StateIndex, retryWprHi, retryWprLo);
+                return NV_ERR_INVALID_STATE;
+            }
+
+            NV_PRINTF(LEVEL_ERROR,
+                      "CMP50_STOCKFLOW_V551: "
+                      "PERSISTENT_READY_REFWSEC idx=%u "
+                      "WPR=%08x:%08x\n",
+                      cmp50StateIndex, retryWprHi, retryWprLo);
+            NV_ASSERT_OK_OR_RETURN(kflcnReset_HAL(pGpu, pKernelFalcon));
+            status = kgspExecuteFwsec_HAL(
+                pGpu, pKernelGsp, pKernelGsp->pPreparedFwsecCmd);
+            portMemFree(pKernelGsp->pPreparedFwsecCmd);
+            pKernelGsp->pPreparedFwsecCmd = NULL;
+            if (status != NV_OK)
+            {
+                NV_PRINTF(LEVEL_ERROR,
+                          "CMP50_STOCKFLOW_V551: "
+                          "PERSISTENT_READY_REFWSEC_FAIL status=0x%x "
+                          "idx=%u\n",
+                          status, cmp50StateIndex);
+                return status;
+            }
+
+            retryWprLo =
+                GPU_REG_RD32(pGpu, NV_PFB_PRI_MMU_WPR2_ADDR_LO);
+            retryWprHi =
+                GPU_REG_RD32(pGpu, NV_PFB_PRI_MMU_WPR2_ADDR_HI);
+            plm = GPU_REG_RD32(pGpu, CMP50_FECS_FEATURE_PLM);
+            speed0 = GPU_REG_RD32(pGpu, CMP50_FECS_SM_SPEED_OVERRIDE_0);
+            speed1 = GPU_REG_RD32(pGpu, CMP50_FECS_SM_SPEED_OVERRIDE_1);
+            if ((g_cmp50StockWprLo[cmp50StateIndex] == 0U) ||
+                (g_cmp50StockWprHi[cmp50StateIndex] == 0U) ||
+                (retryWprLo != g_cmp50StockWprLo[cmp50StateIndex]) ||
+                (retryWprHi != g_cmp50StockWprHi[cmp50StateIndex]) ||
+                (plm != CMP50_FECS_FEATURE_PLM_POSTLOCK) ||
+                (speed0 != CMP50_FECS_SM_SPEED_FULL_0) ||
+                (speed1 != CMP50_FECS_SM_SPEED_FULL_1))
+            {
+                NV_PRINTF(LEVEL_ERROR,
+                          "CMP50_STOCKFLOW_V551: "
+                          "PERSISTENT_READY_REFWSEC_STATE_MISMATCH "
+                          "idx=%u WPR=%08x:%08x FECS=%08x "
+                          "SS0=%08x SS1=%08x\n",
+                          cmp50StateIndex, retryWprHi, retryWprLo,
+                          plm, speed0, speed1);
+                return NV_ERR_INVALID_STATE;
+            }
+            NV_PRINTF(LEVEL_ERROR,
+                      "CMP50_STOCKFLOW_V551: "
+                      "PERSISTENT_READY_REFWSEC_STOCK_WPR_PASS "
+                      "idx=%u WPR=%08x:%08x FECS=%08x "
+                      "SS0=%08x SS1=%08x\n",
+                      cmp50StateIndex, retryWprHi, retryWprLo,
+                      plm, speed0, speed1);
+
+            status = kgspCmp50RebuildStockSignature(pGpu, pKernelGsp);
+            if (status != NV_OK)
+            {
+                NV_PRINTF(LEVEL_ERROR,
+                          "CMP50_STOCKFLOW_V551: "
+                          "PERSISTENT_READY_STOCK_SIGNATURE_FAIL "
+                          "status=0x%x idx=%u\n",
+                          status, cmp50StateIndex);
+                return status;
+            }
+            NV_PRINTF(LEVEL_ERROR,
+                      "CMP50_STOCKFLOW_V551: "
+                      "PERSISTENT_READY_STOCK_SIGNATURE_PASS idx=%u\n",
+                      cmp50StateIndex);
+        }
+        kgspCmp50SetExploitMode(pGpu, NV_FALSE);
+        NV_ASSERT_OK_OR_RETURN(kflcnResetIntoRiscv_HAL(pGpu, pKernelFalcon));
+        kgspProgramLibosBootArgsAddr_HAL(pGpu, pKernelGsp);
+        NV_PRINTF(LEVEL_ERROR,
+                  "CMP50_STOCKFLOW_V551: RETRY_REJOIN_STOCK_BOOTER "
+                  "idx=%u WPR=%08x:%08x\n",
+                  cmp50StateIndex, GPU_REG_RD32(pGpu, NV_PFB_PRI_MMU_WPR2_ADDR_HI), GPU_REG_RD32(pGpu, NV_PFB_PRI_MMU_WPR2_ADDR_LO));
+        bCmp50RetryRejoin = NV_TRUE;
+        goto cmp50_v525_stock_booter;
+    }
+
+cmp50_v274_commit:
+    // V274 commits after FWSEC/FRTS but before switching GSP into RISC-V mode.
+    if ((bootMode == KGSP_BOOT_MODE_NORMAL) &&
+        s_isCmp50ComputeUnlock(pGpu) &&
+        g_cmp50V274FwsecReady[cmp50StateIndex])
+    {
+        NvU32 wpr2Lo = GPU_REG_RD32(pGpu, NV_PFB_PRI_MMU_WPR2_ADDR_LO);
+        NvU32 wpr2Hi = GPU_REG_RD32(pGpu, NV_PFB_PRI_MMU_WPR2_ADDR_HI);
+        NvU32 plm;
+        NvU32 handoffWprLo;
+        NvU32 handoffWprHi;
+        NvU32 speed0;
+        NvU32 speed1;
+
+        NV_PRINTF(LEVEL_ERROR,
+                  "CMP50_COMPUTE_UNLOCK_V274: POST_FWSEC_PRE_GSP_ENTRY "
+                  "WPR=%08x:%08x FECS=%08x RESET=%08x\n",
+                  wpr2Hi, wpr2Lo,
+                  GPU_REG_RD32(pGpu, CMP50_FECS_FEATURE_PLM),
+                  GPU_REG_RD32(pGpu, CMP50_SEC2_RESET_PLM));
+
+        // At this point a cold function normally has WPR down.  Also accept
+        // the valid range form so the test remains bounded across RM retries.
+        if (!((wpr2Hi == 0U) ||
+              ((wpr2Lo != 0U) && (wpr2Lo < wpr2Hi))))
+        {
+            NV_PRINTF(LEVEL_ERROR,
+                      "CMP50_COMPUTE_UNLOCK_V274: unexpected post-FWSEC WPR "
+                      "%08x:%08x\n", wpr2Hi, wpr2Lo);
+            return NV_ERR_INVALID_STATE;
+        }
+
+        /*
+         * The stock WPR lives at the top of framebuffer memory.  The 10 GiB
+         * board reports 027fee00:027fe000, while the 20 GiB board reports
+         * 04ffee00:04ffe000.  Preserve the range produced by this card's
+         * successful FWSEC run instead of comparing against one SKU's
+         * hard-coded addresses.  Only accept the known stock span and never
+         * learn a value from the exploit's WPR-down sentinel state.
+         */
+        if ((wpr2Lo != 0U) && (wpr2Hi > wpr2Lo))
+        {
+            if ((wpr2Hi - wpr2Lo) != CMP50_WPR2_STOCK_SPAN)
+            {
+                NV_PRINTF(LEVEL_ERROR,
+                          "CMP50_WPR_DYNAMIC_V1: STOCK_SPAN_MISMATCH "
+                          "idx=%u WPR=%08x:%08x span=%08x\n",
+                          cmp50StateIndex, wpr2Hi, wpr2Lo,
+                          wpr2Hi - wpr2Lo);
+                return NV_ERR_INVALID_STATE;
+            }
+            g_cmp50StockWprLo[cmp50StateIndex] = wpr2Lo;
+            g_cmp50StockWprHi[cmp50StateIndex] = wpr2Hi;
+            NV_PRINTF(LEVEL_ERROR,
+                      "CMP50_WPR_DYNAMIC_V1: STOCK_RANGE_CAPTURED "
+                      "idx=%u WPR=%08x:%08x span=%08x\n",
+                      cmp50StateIndex, wpr2Hi, wpr2Lo,
+                      wpr2Hi - wpr2Lo);
+        }
+        else if ((g_cmp50StockWprLo[cmp50StateIndex] == 0U) ||
+                 (g_cmp50StockWprHi[cmp50StateIndex] == 0U))
+        {
+            NV_PRINTF(LEVEL_ERROR,
+                      "CMP50_WPR_DYNAMIC_V1: STOCK_RANGE_UNAVAILABLE "
+                      "idx=%u WPR=%08x:%08x\n",
+                      cmp50StateIndex, wpr2Hi, wpr2Lo);
+            return NV_ERR_INVALID_STATE;
+        }
+
+        kgspCmp50SetExploitMode(pGpu, NV_TRUE);
+        status = _kgspCmp50ExecuteBooterFreshMeta(pGpu, pKernelGsp);
+        kgspCmp50SetExploitMode(pGpu, NV_FALSE);
+        plm = GPU_REG_RD32(pGpu, CMP50_FECS_FEATURE_PLM);
+        handoffWprLo = GPU_REG_RD32(pGpu, NV_PFB_PRI_MMU_WPR2_ADDR_LO);
+        handoffWprHi = GPU_REG_RD32(pGpu, NV_PFB_PRI_MMU_WPR2_ADDR_HI);
+        speed0 = GPU_REG_RD32(pGpu, CMP50_FECS_SM_SPEED_OVERRIDE_0);
+        speed1 = GPU_REG_RD32(pGpu, CMP50_FECS_SM_SPEED_OVERRIDE_1);
+        if ((status != NV_OK) ||
+            (plm != CMP50_FECS_FEATURE_PLM_POSTLOCK) ||
+            (handoffWprLo != CMP50_WPR2_ADDR_LO_DOWN) ||
+            (handoffWprHi != 0U) ||
+            (speed0 != CMP50_FECS_SM_SPEED_FULL_0) ||
+            (speed1 != CMP50_FECS_SM_SPEED_FULL_1))
+        {
+            NV_PRINTF(LEVEL_ERROR,
+                      "CMP50_COMPUTE_UNLOCK_V274: POST_FWSEC_COMMIT_FAIL "
+                      "status=%x WPR=%08x:%08x FECS=%08x "
+                      "SS0=%08x SS1=%08x\n",
+                      status, handoffWprHi, handoffWprLo, plm,
+                      speed0, speed1);
+            return NV_ERR_INVALID_STATE;
+        }
+
+        status = kgspCmp50RebuildStockSignature(pGpu, pKernelGsp);
+        if (status != NV_OK)
+            return status;
+
+        /*
+         * The signed verifier tail marks this metadata verified and advances
+         * bootCount before the protected cleanup drops WPR2. Reusing those
+         * output flags makes the next stock Booter return NV_OK without
+         * rebuilding WPR2 or starting GSP-RM. Restore only the two cold-input
+         * fields initialized by kgspPopulateWprMeta_TU102; keep every layout
+         * address and firmware pointer produced by the stock path.
+         */
+        NV_PRINTF(LEVEL_ERROR,
+                  "CMP50_COMPUTE_UNLOCK_V523: WPR_META_BEFORE_RESET "
+                  "bootCount=0x%016llx verified=0x%016llx\n",
+                  pKernelGsp->pWprMeta->bootCount,
+                  pKernelGsp->pWprMeta->verified);
+        pKernelGsp->pWprMeta->bootCount = 0;
+        pKernelGsp->pWprMeta->verified = 0;
+        memdescFlushCpuCaches(pGpu, pKernelGsp->pWprMetaDescriptor);
+        NV_PRINTF(LEVEL_ERROR,
+                  "CMP50_COMPUTE_UNLOCK_V523: "
+                  "WPR_META_INPUT_RESET_PASS bootCount=0 verified=0\n");
+
+        status = kgspCmp50SanitizeSec2AfterExploit(pGpu, pKernelGsp);
+        if (status != NV_OK)
+            return status;
+
+        plm = GPU_REG_RD32(pGpu, CMP50_FECS_FEATURE_PLM);
+        handoffWprLo = GPU_REG_RD32(pGpu, NV_PFB_PRI_MMU_WPR2_ADDR_LO);
+        handoffWprHi = GPU_REG_RD32(pGpu, NV_PFB_PRI_MMU_WPR2_ADDR_HI);
+        speed0 = GPU_REG_RD32(pGpu, CMP50_FECS_SM_SPEED_OVERRIDE_0);
+        speed1 = GPU_REG_RD32(pGpu, CMP50_FECS_SM_SPEED_OVERRIDE_1);
+        if ((plm != CMP50_FECS_FEATURE_PLM_POSTLOCK) ||
+            (handoffWprLo != CMP50_WPR2_ADDR_LO_DOWN) ||
+            (handoffWprHi != 0U) ||
+            (speed0 != CMP50_FECS_SM_SPEED_FULL_0) ||
+            (speed1 != CMP50_FECS_SM_SPEED_FULL_1))
+        {
+            NV_PRINTF(LEVEL_ERROR,
+                      "CMP50_COMPUTE_UNLOCK_V276: SANITIZE_STATE_LOST "
+                      "WPR=%08x:%08x FECS=%08x SS0=%08x SS1=%08x\n",
+                      handoffWprHi, handoffWprLo, plm, speed0, speed1);
+            return NV_ERR_INVALID_STATE;
+        }
+
+        NV_PRINTF(LEVEL_ERROR,
+                  "CMP50_COMPUTE_UNLOCK_V526: "
+                  "FULLSPEED_STOCK_RELOCK_WPR_DOWN_HANDOFF_PASS "
+                  "WPR=%08x:%08x FECS=%08x RESET=%08x "
+                  "SS0=%08x SS1=%08x\n",
+                  handoffWprHi, handoffWprLo, plm,
+                  GPU_REG_RD32(pGpu, CMP50_SEC2_RESET_PLM),
+                  speed0, speed1);
+
+        /*
+         * V551 single-module stock-flow experiment. V534 stopped here so an
+         * external transaction could unload this module and hand the preserved
+         * WPR-down/full-speed state to a separately hashed V529 stock path.
+         * For the patched-driver lane, keep the same exact handoff gate, then
+         * continue into the already staged V524/V525 stock FWSEC/RISCV/Booter
+         * continuation below.
+         */
+        if (GPU_REG_RD32(pGpu, CMP50_SEC2_RESET_PLM) != 0x000000FFU)
+            return NV_ERR_INVALID_STATE;
+        g_cmp50V274PhaseCommitted[cmp50StateIndex] = NV_TRUE;
+        NV_PRINTF(LEVEL_ERROR,
+                  "CMP50_COMPUTE_UNLOCK_V534: "
+                  "TOKEN_RELEASE_RESETPLM_FF_PHASE_BOUNDARY_PASS "
+                  "idx=%u WPR=%08x:%08x FECS=%08x RESET=%08x "
+                  "SS0=%08x SS1=%08x retry_guard=armed\n",
+                  cmp50StateIndex,
+                  handoffWprHi, handoffWprLo, plm,
+                  GPU_REG_RD32(pGpu, CMP50_SEC2_RESET_PLM),
+                  speed0, speed1);
+        NV_PRINTF(LEVEL_ERROR,
+                  "CMP50_STOCKFLOW_V551: BDF_STATE "
+                  "idx=%u bus=%u device=%u gpuInstance=%u "
+                  "from_v534_phase_boundary\n",
+                  cmp50StateIndex, gpuGetBus(pGpu), gpuGetDevice(pGpu),
+                  pGpu->gpuInstance);
+
+        /*
+         * Stock TU102 establishes the FRTS/WPR2 range with FWSEC before
+         * Booter Load. V522/V523 skipped directly from signed WPR-down
+         * cleanup to Booter, which returned NV_OK without raising WPR2.
+         * Replay the untouched driver-prepared FWSEC command and require the
+         * exact stock range while retaining the protected full-speed state.
+         */
+        if (pKernelGsp->pPreparedFwsecCmd == NULL)
+            return NV_ERR_INVALID_STATE;
+        NV_ASSERT_OK_OR_RETURN(kflcnReset_HAL(pGpu, pKernelFalcon));
+        status = kgspExecuteFwsec_HAL(
+            pGpu, pKernelGsp, pKernelGsp->pPreparedFwsecCmd);
+        portMemFree(pKernelGsp->pPreparedFwsecCmd);
+        pKernelGsp->pPreparedFwsecCmd = NULL;
+        if (status != NV_OK)
+        {
+            NV_PRINTF(LEVEL_ERROR,
+                      "CMP50_COMPUTE_UNLOCK_V524: REFWSEC_FAIL status=0x%x\n",
+                      status);
+            return status;
+        }
+
+        plm = GPU_REG_RD32(pGpu, CMP50_FECS_FEATURE_PLM);
+        handoffWprLo = GPU_REG_RD32(pGpu, NV_PFB_PRI_MMU_WPR2_ADDR_LO);
+        handoffWprHi = GPU_REG_RD32(pGpu, NV_PFB_PRI_MMU_WPR2_ADDR_HI);
+        speed0 = GPU_REG_RD32(pGpu, CMP50_FECS_SM_SPEED_OVERRIDE_0);
+        speed1 = GPU_REG_RD32(pGpu, CMP50_FECS_SM_SPEED_OVERRIDE_1);
+        if ((handoffWprLo != g_cmp50StockWprLo[cmp50StateIndex]) ||
+            (handoffWprHi != g_cmp50StockWprHi[cmp50StateIndex]) ||
+            (plm != CMP50_FECS_FEATURE_PLM_POSTLOCK) ||
+            (speed0 != CMP50_FECS_SM_SPEED_FULL_0) ||
+            (speed1 != CMP50_FECS_SM_SPEED_FULL_1))
+        {
+            NV_PRINTF(LEVEL_ERROR,
+                      "CMP50_COMPUTE_UNLOCK_V524: REFWSEC_STATE_MISMATCH "
+                      "status=0x%x WPR=%08x:%08x FECS=%08x "
+                      "SS0=%08x SS1=%08x\n",
+                      status, handoffWprHi, handoffWprLo, plm,
+                      speed0, speed1);
+            return NV_ERR_INVALID_STATE;
+        }
+        NV_PRINTF(LEVEL_ERROR,
+                  "CMP50_COMPUTE_UNLOCK_V524: REFWSEC_STOCK_WPR_PASS "
+                  "WPR=%08x:%08x FECS=%08x SS0=%08x SS1=%08x\n",
+                  handoffWprHi, handoffWprLo, plm, speed0, speed1);
+
+        /*
+         * Rejoin the two stock instructions that normally run immediately
+         * after FWSEC and before Booter Load. V524 jumped over both when it
+         * entered the in-place Booter label, leaving GSP in Falcon mode with
+         * no LibOS boot-argument address even though FWSEC and Booter passed.
+         */
+        NV_ASSERT_OK_OR_RETURN(
+            kflcnResetIntoRiscv_HAL(pGpu, pKernelFalcon));
+        kgspProgramLibosBootArgsAddr_HAL(pGpu, pKernelGsp);
+        if ((GPU_REG_RD32(pGpu, NV_PFB_PRI_MMU_WPR2_ADDR_LO) !=
+             g_cmp50StockWprLo[cmp50StateIndex]) ||
+            (GPU_REG_RD32(pGpu, NV_PFB_PRI_MMU_WPR2_ADDR_HI) !=
+             g_cmp50StockWprHi[cmp50StateIndex]) ||
+            (GPU_REG_RD32(pGpu, CMP50_FECS_FEATURE_PLM) !=
+             CMP50_FECS_FEATURE_PLM_POSTLOCK) ||
+            (GPU_REG_RD32(pGpu, CMP50_FECS_SM_SPEED_OVERRIDE_0) !=
+             CMP50_FECS_SM_SPEED_FULL_0) ||
+            (GPU_REG_RD32(pGpu, CMP50_FECS_SM_SPEED_OVERRIDE_1) !=
+             CMP50_FECS_SM_SPEED_FULL_1))
+        {
+            NV_PRINTF(LEVEL_ERROR,
+                      "CMP50_COMPUTE_UNLOCK_V525: "
+                      "RISCV_BOOTARGS_STATE_MISMATCH\n");
+            return NV_ERR_INVALID_STATE;
+        }
+        NV_PRINTF(LEVEL_ERROR,
+                  "CMP50_COMPUTE_UNLOCK_V525: "
+                  "RISCV_MODE_BOOTARGS_PASS WPR=%08x:%08x "
+                  "FECS=%08x SS0=%08x SS1=%08x\n",
+                  GPU_REG_RD32(pGpu, NV_PFB_PRI_MMU_WPR2_ADDR_HI),
+                  GPU_REG_RD32(pGpu, NV_PFB_PRI_MMU_WPR2_ADDR_LO),
+                  GPU_REG_RD32(pGpu, CMP50_FECS_FEATURE_PLM),
+                  GPU_REG_RD32(pGpu, CMP50_FECS_SM_SPEED_OVERRIDE_0),
+                  GPU_REG_RD32(pGpu, CMP50_FECS_SM_SPEED_OVERRIDE_1));
+
+        NV_PRINTF(LEVEL_ERROR,
+                  "CMP50_COMPUTE_UNLOCK_V274: POST_FWSEC_PRE_GSP_HANDOFF_PASS "
+                  "WPR=%08x:%08x FECS=%08x RESET=%08x "
+                  "SS0=%08x SS1=%08x\n",
+                  handoffWprHi, handoffWprLo, plm,
+                  GPU_REG_RD32(pGpu, CMP50_SEC2_RESET_PLM),
+                  speed0, speed1);
+        g_cmp50V274PhaseCommitted[cmp50StateIndex] = NV_TRUE;
+        NV_PRINTF(LEVEL_ERROR,
+                  "CMP50_COMPUTE_UNLOCK_V525: INPLACE_STOCK_BOOTER_COMMIT "
+                  "idx=%u retry_guard=armed\n",
+                  cmp50StateIndex);
+        goto cmp50_v525_stock_booter;
+    }
 
     // Execute Scrubber if needed
     if (((bootMode == KGSP_BOOT_MODE_SR_RESUME) || (bootMode == KGSP_BOOT_MODE_NORMAL)) &&
@@ -568,12 +1329,30 @@ kgspBootstrap_TU102
             if (status != NV_OK) return status;
 
             status = kgspExecuteFwsec_HAL(pGpu, pKernelGsp, pKernelGsp->pPreparedFwsecCmd);
-            portMemFree(pKernelGsp->pPreparedFwsecCmd);
-            pKernelGsp->pPreparedFwsecCmd = NULL;
+            /*
+             * Retain the stock prepared FRTS command on the exact CMP50
+             * target for one bounded replay after the signed WPR-down
+             * transaction. Other devices keep the stock lifetime.
+             */
+            if (!s_isCmp50ComputeUnlock(pGpu))
+            {
+                portMemFree(pKernelGsp->pPreparedFwsecCmd);
+                pKernelGsp->pPreparedFwsecCmd = NULL;
+            }
 
             NV_PRINTF(LEVEL_ERROR,
                       "SEC2_DEBUG: FWSEC status=0x%x\n", status);
             if (status != NV_OK) return status;
+        }
+
+        if (s_isCmp50ComputeUnlock(pGpu))
+        {
+            g_cmp50V274FwsecReady[cmp50StateIndex] = NV_TRUE;
+            NV_PRINTF(LEVEL_ERROR,
+                      "CMP50_COMPUTE_UNLOCK_V274: "
+                      "FWSEC_COMPLETE_GSP_UNTOUCHED idx=%u\n",
+                      cmp50StateIndex);
+            goto cmp50_v274_commit;
         }
 
         status = kflcnResetIntoRiscv_HAL(pGpu, pKernelFalcon);
@@ -585,9 +1364,20 @@ kgspBootstrap_TU102
         kgspProgramLibosBootArgsAddr_HAL(pGpu, pKernelGsp);
     }
 
-    // Execute Booter Load
-    status = kgspExecuteBooterLoad_HAL(pGpu, pKernelGsp,
-                                       _kgspGetBooterLoadArgs(pKernelGsp, bootMode));
+cmp50_v525_stock_booter:
+    // Execute stock Booter Load in the same RM/WPR-metadata context.
+    if ((bootMode == KGSP_BOOT_MODE_NORMAL) &&
+        s_isCmp50ComputeUnlock(pGpu) &&
+        !bCmp50RetryRejoin)
+    {
+        status = _kgspCmp50ExecuteBooterFreshMeta(pGpu, pKernelGsp);
+    }
+    else
+    {
+        status = kgspExecuteBooterLoad_HAL(
+            pGpu, pKernelGsp,
+            _kgspGetBooterLoadArgs(pKernelGsp, bootMode));
+    }
 
     {
         NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
@@ -655,6 +1445,46 @@ kgspBootstrap_TU102
         return status;
     }
 
+    if ((bootMode == KGSP_BOOT_MODE_NORMAL) &&
+        s_isCmp50ComputeUnlock(pGpu))
+    {
+        NvU32 postWprLo = GPU_REG_RD32(pGpu, NV_PFB_PRI_MMU_WPR2_ADDR_LO);
+        NvU32 postWprHi = GPU_REG_RD32(pGpu, NV_PFB_PRI_MMU_WPR2_ADDR_HI);
+        NvU32 postSpeed0 = GPU_REG_RD32(pGpu, CMP50_FECS_SM_SPEED_OVERRIDE_0);
+        NvU32 postSpeed1 = GPU_REG_RD32(pGpu, CMP50_FECS_SM_SPEED_OVERRIDE_1);
+        NvU32 postPlm = GPU_REG_RD32(pGpu, CMP50_FECS_FEATURE_PLM);
+        NvU32 postResetPlm =
+            GPU_REG_RD32(pGpu, CMP50_SEC2_RESET_PLM);
+        if ((postWprLo >= postWprHi) ||
+            (postSpeed0 != CMP50_FECS_SM_SPEED_FULL_0) ||
+            (postSpeed1 != CMP50_FECS_SM_SPEED_FULL_1) ||
+            (postPlm != CMP50_FECS_FEATURE_PLM_POSTLOCK) ||
+            ((postResetPlm != CMP50_SEC2_RESET_PLM_STOCK) &&
+             (postResetPlm != 0x000000FFU)))
+        {
+            NV_PRINTF(LEVEL_ERROR,
+                      "CMP50_COMPUTE_UNLOCK_V525: stock Booter mismatch "
+                      "WPR=%08x:%08x SS0=0x%08x SS1=0x%08x "
+                      "FECS=0x%08x RESET=0x%08x\n",
+                      postWprHi, postWprLo, postSpeed0, postSpeed1,
+                      postPlm, postResetPlm);
+            return NV_ERR_INVALID_STATE;
+        }
+        if (postResetPlm == 0x000000FFU)
+        {
+            NV_PRINTF(LEVEL_ERROR,
+                      "CMP50_STOCKFLOW_V551: "
+                      "STOCK_BOOTER_RESET_FF_ACCEPTED\n");
+        }
+        NV_PRINTF(LEVEL_ERROR,
+                  "CMP50_COMPUTE_UNLOCK_V525: INPLACE_STOCK_BOOTER_AFTER_UNLOCK_PASS "
+                  "WPR=%08x:%08x SS0=0x%08x SS1=0x%08x "
+                  "FECS_PLM=0x%08x RESET_PLM=0x%08x\n",
+                  postWprHi, postWprLo, postSpeed0, postSpeed1,
+                  postPlm, postResetPlm);
+        s_cmp50ApplyGen2Policy(pGpu, "post-booter");
+    }
+
     // Send init RPCs necessary for GSP-RM booting, before creating OBJGPU.
     // Skips for suspend/resume as GSP saves/restores context
     if (bootMode == KGSP_BOOT_MODE_NORMAL)
@@ -698,6 +1528,23 @@ kgspBootstrap_TU102
     NV_ASSERT_OK_OR_RETURN(kgspWaitForRmInitDone(pGpu, pKernelGsp));
 
     NV_PRINTF(LEVEL_INFO, "GSP FW RM ready.\n");
+
+    if ((pGpu->idInfo.PCIDeviceID == 0x1E0910DEU) &&
+        ((pGpu->idInfo.PCISubDeviceID == 0x155410DEU) || (pGpu->idInfo.PCISubDeviceID == 0x371F1462U)))
+    {
+        s_cmp50ApplyGen2Policy(pGpu, "gsp-ready");
+        g_cmp50V274GspReady[cmp50StateIndex] = NV_TRUE;
+        NV_PRINTF(LEVEL_ERROR,
+                  "CMP50_GSP_READY_V551: feature=0x%08x ss0=0x%08x "
+                  "readout=0x%08x ss1=0x%08x\n",
+                  GPU_REG_RD32(pGpu, CMP50_FECS_FEATURE_READOUT),
+                  GPU_REG_RD32(pGpu,
+                      CMP50_FECS_FEATURE_OVERRIDE_SM_SPEED_SELECT),
+                  GPU_REG_RD32(pGpu,
+                      CMP50_FECS_FEATURE_READOUT_SM_SPEED_SELECT),
+                  GPU_REG_RD32(pGpu,
+                      CMP50_FECS_FEATURE_OVERRIDE_SM_SPEED_SELECT_1));
+    }
 
     return NV_OK;
 }
@@ -798,6 +1645,18 @@ kgspGetGspRmBootUcodeStorage_TU102
 )
 {
     const BINDATA_ARCHIVE *pBinArchive = kgspGetBinArchiveGspRmBoot_HAL(pKernelGsp);
+
+    if (pBinArchive == NULL)
+    {
+        if (s_isCmp50ComputeUnlock(pGpu))
+        {
+            NV_PRINTF(LEVEL_ERROR,
+                      "CMP50_STOCKFLOW_V551: GSP_RM_BOOT_ARCHIVE_NULL\n");
+        }
+        *ppBinStorageImage = NULL;
+        *ppBinStorageDesc = NULL;
+        return;
+    }
 
     *ppBinStorageImage = (BINDATA_STORAGE *) bindataArchiveGetStorage(pBinArchive, BINDATA_LABEL_UCODE_IMAGE);
     *ppBinStorageDesc  = (BINDATA_STORAGE *) bindataArchiveGetStorage(pBinArchive, BINDATA_LABEL_UCODE_DESC);

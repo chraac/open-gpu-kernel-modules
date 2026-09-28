@@ -39,6 +39,36 @@
 #include "published/turing/tu102/dev_gc6_island.h"
 #include "published/turing/tu102/dev_gc6_island_addendum.h"
 
+static NvBool s_cmp50ExploitMode[8192U];
+static NvU32
+s_cmp50ExploitModeIndex
+(
+    OBJGPU *pGpu
+)
+{
+    NvU32 idx = (gpuGetBus(pGpu) * 32U) + gpuGetDevice(pGpu);
+    return (idx < 8192U) ? idx : 0U;
+}
+
+void
+kgspCmp50SetExploitMode
+(
+    OBJGPU *pGpu,
+    NvBool bEnabled
+)
+{
+    s_cmp50ExploitMode[s_cmp50ExploitModeIndex(pGpu)] = bEnabled;
+}
+
+NvBool
+kgspCmp50GetExploitMode
+(
+    OBJGPU *pGpu
+)
+{
+    return s_cmp50ExploitMode[s_cmp50ExploitModeIndex(pGpu)];
+}
+
 /*!
  * Copy sizeBytes from pSrc to DMEM offset dmemDest using DMEM access port 0.
  *
@@ -422,8 +452,23 @@ kgspExecuteHsFalcon_TU102
     // Start CPU now
     kflcnStartCpu_HAL(pGpu, pKernelFlcn);
 
-    // Wait for completion
-    status = kflcnWaitForHalt_HAL(pGpu, pKernelFlcn, GPU_TIMEOUT_DEFAULT, 0);
+    // Wait for completion. Limit only the exact CMP 50HX research target so
+    // V34 can test a bounded set of safe-loop stack positions quickly.
+    if ((pGpu->idInfo.PCIDeviceID == 0x1E0910DEU) &&
+        ((pGpu->idInfo.PCISubDeviceID == 0x155410DEU) || (pGpu->idInfo.PCISubDeviceID == 0x371F1462U)) &&
+        kgspCmp50GetExploitMode(pGpu) &&
+        (pFlcnUcode == pKernelGsp->pBooterLoadUcode))
+    {
+        status = kflcnWaitForHalt_HAL(pGpu, pKernelFlcn, 250000U, 0);
+        NV_PRINTF(LEVEL_ERROR,
+                  "CMP50_COMPUTE_UNLOCK_V520: exploit Booter-only bounded "
+                  "halt wait status=0x%x\n", status);
+    }
+    else
+    {
+        status = kflcnWaitForHalt_HAL(pGpu, pKernelFlcn,
+                                      GPU_TIMEOUT_DEFAULT, 0);
+    }
 
     // Read mailboxes if requested
     if (pMailbox0 != NULL)
