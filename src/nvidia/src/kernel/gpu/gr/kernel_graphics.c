@@ -1250,6 +1250,13 @@ kgraphicsLoadStaticInfo_KERNEL
                     NV0080_CTRL_GR_INFO_MAX_SIZE * sizeof(*pPrivate->staticInfo.pGrInfo->infoList),
                     pParams->info.engineInfo[grIdx].infoList,
                     NV0080_CTRL_GR_INFO_MAX_SIZE * sizeof(*pParams->info.engineInfo[grIdx].infoList));
+        if ((pGpu->idInfo.PCIDeviceID == 0x1E0910DEU) &&
+            ((pGpu->idInfo.PCISubDeviceID == 0x155410DEU) ||
+             (pGpu->idInfo.PCISubDeviceID == 0x371F1462U)))
+        {
+            pPrivate->staticInfo.pGrInfo->
+                infoList[NV2080_CTRL_GR_INFO_INDEX_RT_CORE_COUNT].data = 56U;
+        }
 
     }
 
