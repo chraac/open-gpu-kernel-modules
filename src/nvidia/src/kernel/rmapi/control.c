@@ -43,6 +43,42 @@
 #include "ctrl/ctrl2080/ctrl2080tmr.h" // NV2080_CTRL_CMD_TIMER_SCHEDULE
 #include "ctrl/ctrl2080/ctrl2080fb.h" // NV2080_CTRL_CMD_FB_GET_MEM_ALIGNMENT
 
+NvBool
+rmapiIsCmp170hxGpu
+(
+    NvHandle hClient,
+    NvHandle hObject
+)
+{
+    NV_STATUS  status;
+    RsClient  *pClient = NULL;
+    NvBool     bBcResource = NV_FALSE;
+    OBJGPU    *pGpu = NULL;
+    NvBool     bApiLockTaken = NV_FALSE;
+    NvU32      devId = 0;
+
+    if (!rmapiLockIsOwner())
+    {
+        status = rmapiLockAcquire(RMAPI_LOCK_FLAGS_READ, RM_LOCK_MODULES_CLIENT);
+        if (status != NV_OK)
+            return NV_FALSE;
+        bApiLockTaken = NV_TRUE;
+    }
+
+    status = serverGetClientUnderLock(&g_resServ, hClient, &pClient);
+    if (status == NV_OK && pClient != NULL)
+    {
+        status = gpuGetByHandle(pClient, hObject, &bBcResource, &pGpu);
+        if (status == NV_OK && pGpu != NULL)
+            devId = pGpu->idInfo.PCIDeviceID >> 16;
+    }
+
+    if (bApiLockTaken)
+        rmapiLockRelease();
+
+    return (devId == 0x20C2) || (devId == 0x2082);
+}
+
 static NV_STATUS
 releaseDeferRmCtrlBuffer(RmCtrlDeferredCmd* pRmCtrlDeferredCmd)
 {

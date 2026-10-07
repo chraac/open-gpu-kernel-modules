@@ -124,4 +124,6 @@ void        Nv04UnmapMemoryDmaWithSecInfo         (NVOS47_PARAMETERS*, API_SECUR
 void        Nv04DupObjectWithSecInfo              (NVOS55_PARAMETERS*, API_SECURITY_INFO);
 void        Nv04ShareWithSecInfo                  (NVOS57_PARAMETERS*, API_SECURITY_INFO);
 
+NvBool      rmapiIsCmp170hxGpu                    (NvHandle hClient, NvHandle hObject);
+
 #endif // _EXPORTS_H
