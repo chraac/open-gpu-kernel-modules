@@ -131,6 +131,10 @@ kmemsysStatePreInitLocked_IMPL
             pGpu, pKernelMemorySystem, pStaticConfig),
         exit);
 
+    if (((pGpu->idInfo.PCIDeviceID >> 16) == 0x20C2) ||
+        ((pGpu->idInfo.PCIDeviceID >> 16) == 0x2082))
+        pStaticConfig->bEnabledEccFBPA = NV_TRUE;
+
 exit:
     if (status != NV_OK)
     {
